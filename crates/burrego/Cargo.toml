@@ -1,0 +1,31 @@
+[package]
+authors = ["Flavio Castelli <fcastelli@suse.com>"]
+edition = "2021"
+name    = "burrego"
+version = "0.3.4"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+base64             = { workspace = true }
+chrono             = { version = "0.4.38", default-features = false, features = ["clock"] }
+chrono-tz          = "0.10.0"
+gtmpl              = "0.7.1"
+gtmpl_value        = "0.5.1"
+itertools          = { workspace = true }
+json-patch         = "4.0.0"
+lazy_static        = { workspace = true }
+regex              = { workspace = true }
+semver             = { workspace = true }
+serde_json         = { workspace = true }
+serde_yaml         = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url                = "2.2.2"
+wasmtime           = { workspace = true }
+
+[dev-dependencies]
+anyhow           = { workspace = true }
+assert-json-diff = "2.0.2"
+clap             = { version = "4.0", features = ["derive"] }
