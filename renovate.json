@@ -4,6 +4,9 @@
     "helpers:pinGitHubActionDigestsToSemver",
     "schedule:weekends"
   ],
+  "ignoreDeps": [
+    "sigs.k8s.io/wg-policy-prototypes"
+  ],
   "labels": [
     "area/dependencies"
   ],
@@ -12,6 +15,31 @@
     "automerge": false
   },
   "packageRules": [
+    {
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "kubewarden/kubewarden-controller",
+        "kubewarden/audit-scanner"
+      ],
+      "matchPaths": [
+        "charts/kubewarden-controller/values.yaml"
+      ],
+      "enabled": false
+    },
+    {
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "kubewarden/policy-server"
+      ],
+      "matchPaths": [
+        "charts/kubewarden-defaults/values.yaml"
+      ],
+      "enabled": false
+    },
     {
       "matchPackageNames": [
         "k8s.io/client-go"
@@ -41,21 +69,6 @@
         "github-actions"
       ],
       "groupName": "GitHub Actions"
-    },
-    {
-      "description": "bundle dependencies updates together",
-      "matchUpdateTypes": [
-        "patch",
-        "minor",
-        "major"
-      ],
-      "groupName": "all dependencies updates",
-      "groupSlug": "all-updates",
-      "matchPackageNames": [
-        "*"
-      ],
-      "semanticCommits": "enabled",
-      "semanticCommitType": "build"
     }
   ],
   "rebaseWhen": "behind-base-branch",

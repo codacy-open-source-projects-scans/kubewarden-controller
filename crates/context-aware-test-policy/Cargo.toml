@@ -1,6 +1,6 @@
 [package]
 authors = ["Fabrizio Sestito <fabrizio.sestito@suse.com>"]
-edition = "2021"
+edition = "2024"
 name    = "context-aware-test-policy"
 version = "0.2.1"
 
@@ -15,4 +15,4 @@ kubewarden-policy-sdk = { workspace = true }
 lazy_static           = { workspace = true }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
-slog                  = "2.7"
+slog                  = "2.8"
