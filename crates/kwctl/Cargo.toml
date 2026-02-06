@@ -3,7 +3,7 @@ authors     = ["Kubewarden Developers <cncf-kubewarden-maintainers@lists.cncf.io
 description = "Tool to manage Kubewarden policies"
 edition     = "2024"
 name        = "kwctl"
-version     = "1.32.0-rc5"
+version     = "1.32.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -33,7 +33,7 @@ serde_yaml         = { workspace = true }
 tar                = "0.4.44"
 termimad           = "0.34.1"
 thiserror          = { workspace = true }
-time               = "0.3.46"
+time               = "0.3.47"
 tiny-bench         = "0.4"
 tokio              = { workspace = true }
 tracing            = { workspace = true }
