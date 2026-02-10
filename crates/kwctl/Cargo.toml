@@ -3,7 +3,7 @@ authors     = ["Kubewarden Developers <cncf-kubewarden-maintainers@lists.cncf.io
 description = "Tool to manage Kubewarden policies"
 edition     = "2024"
 name        = "kwctl"
-version     = "1.32.0"
+version     = "1.32.1"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -59,7 +59,7 @@ predicates     = "3.1"
 rstest         = { workspace = true }
 sha2           = { workspace = true }
 tempfile       = { workspace = true }
-testcontainers = { version = "0.26", features = ["blocking"] }
+testcontainers = { version = "0.27", features = ["blocking"] }
 tower-test     = "0.4"
 
 
