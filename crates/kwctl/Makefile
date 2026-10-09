@@ -7,11 +7,11 @@ build-release:
 
 .PHONY:build-docs
 build-docs:
-	cargo run --release -- docs --output cli-docs.md
+	cargo run --release -- docs --output cli-docs.adoc
 
 .PHONY: fmt
 fmt:
-	cargo fmt --all -- --check
+	cargo +nightly fmt --all -- --check
 
 .PHONY: lint
 lint:

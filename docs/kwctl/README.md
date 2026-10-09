@@ -44,12 +44,17 @@ containers.
 ## Install
 
 Built binaries for `Linux x86_64`, `Windows x86_64`, `MacOS x86_64` and `MacOS
-aarch64 (M1)` are available in [GH Releases](https://github.com/kubewarden/kwctl/releases).
+aarch64 (M1)` are available in [GH Releases](https://github.com/kubewarden/adm-controller/releases) (check the `kwctl-${os}-${arch}.zip` files).
 
 There is also:
 
 - Community-created [Homebrew 🍺 formula for kwctl](https://formulae.brew.sh/formula/kwctl)
 - Community-created [AUR 🐧 package](https://aur.archlinux.org/packages/kwctl-bin)
+- Source install with Cargo. You can pull the latest version from main, or chose a specific git tag.
+
+```bash
+cargo install --git https://github.com/kubewarden/adm-controller kwctl [--tag <desired-version>]
+```
 
 ## Usage
 
@@ -187,6 +192,20 @@ The act of adding metadata to the policy is done by the policy author, right
 before policy distribution.
 
 The `kwctl annotate` command can be used to perform this operation.
+
+`kwctl annotate` can also change a single annotation of a policy that is
+already annotated. Use the `--annotation` (or `-a`) flag with a `KEY=VALUE`
+pair. You can repeat this flag. Use `KEY=@PATH` to read the value from a
+file instead of the command line.
+
+This is useful, for example, when you redistribute a policy pulled from
+another registry and only need to change a couple of annotations:
+
+```console
+kwctl annotate \
+  --annotation io.kubewarden.policy.ociUrl=registry.corp.example/kubewarden/foo:v1.0.0 \
+  -o foo-internal.wasm foo.wasm
+```
 
 ### Inspect a policy
 

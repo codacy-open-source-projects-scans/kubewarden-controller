@@ -12,18 +12,21 @@ version = "0.32.0"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = "0.1"
 base64 = { workspace = true }
 burrego = { path = "../burrego" }
-cached = { version = "0.59", features = ["async_tokio_rt_multi_thread"] }
+bytes = "1"
 chrono = { version = "0.4", default-features = false }
-dns-lookup = "3.0"
+dns-lookup = "4.0"
 email_address = { version = "0.2", features = ["serde"] }
+ferricel-core = { workspace = true }
+ferricel-types = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 itertools = { workspace = true }
 json-patch = "4.1"
 k8s-openapi = { workspace = true }
-kube = { version = "3.0.1", default-features = false, features = [
+kube = { version = "4", default-features = false, features = [
   "client",
   "runtime",
   "rustls-tls",
@@ -31,6 +34,7 @@ kube = { version = "3.0.1", default-features = false, features = [
 kubewarden-policy-sdk = { workspace = true, features = ["crd"] }
 lazy_static = { workspace = true }
 mail-parser = { version = "0.11", features = ["serde"] }
+moka = { version = "0.12", features = ["future"] }
 pki-types = { package = "rustls-pki-types", version = "1.14", default-features = false, features = [
   "std",
 ] }
@@ -42,18 +46,19 @@ rustls-webpki = { version = "0.103", default-features = false, features = [
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_path_to_error = "0.1"
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
+slog = "2"
 thiserror = { workspace = true }
 time = { version = "0.3", features = ["serde-human-readable"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 tracing = { workspace = true }
 url = { workspace = true }
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 wapc = "2.1"
-wasi-common = { workspace = true }
-wasmparser = "0.247"
-wasmtime-provider = { version = "2.19.0", features = ["cache"] }
+wasmparser = "0.259"
+wasmtime-provider = { version = "2.26.0", features = ["cache"] }
 wasmtime-wasi = { workspace = true }
 webpki-roots = "1"
 
@@ -98,14 +103,17 @@ backon = { version = "1.6", features = ["tokio-sleep"] }
 hyper = { version = "1" }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 rstest = { workspace = true }
-serial_test = "3.3"
+serial_test = "4.0"
 tempfile = { workspace = true }
 test-context = "0.5"
 test-log = "0.2"
-testcontainers = { version = "0.27", default-features = false, features = [
+testcontainers = { version = "0.28", default-features = false, features = [
   "aws-lc-rs",
 ] }
+tokio = { workspace = true, features = ["io-util", "macros"] }
 tower-test = "0.4"
+# Used by the ferricel tests to rewrite the custom sections of a compiled module.
+walrus = "0.27"
 # This is required to have reqwest built using the `rustls-tls-native-roots`
 # feature across all the transitive dependencies of policy-fetcher
 # This is required to have the integration tests use the system certificates instead of the

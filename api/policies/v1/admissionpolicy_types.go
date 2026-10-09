@@ -32,6 +32,7 @@ type AdmissionPolicySpec struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=ap
 // +kubebuilder:storageversion
+// +kubebuilder:metadata:annotations="helm.sh/resource-policy=keep"
 // +kubebuilder:printcolumn:name="Policy Server",type=string,JSONPath=`.spec.policyServer`,description="Bound to Policy Server"
 // +kubebuilder:printcolumn:name="Mutating",type=boolean,JSONPath=`.spec.mutating`,description="Whether the policy is mutating"
 // +kubebuilder:printcolumn:name="BackgroundAudit",type=boolean,JSONPath=`.spec.backgroundAudit`,description="Whether the policy is used in audit checks"
@@ -56,10 +57,6 @@ type AdmissionPolicyList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AdmissionPolicy `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&AdmissionPolicy{}, &AdmissionPolicyList{})
 }
 
 func (r *AdmissionPolicy) SetStatus(status PolicyStatusEnum) {
@@ -157,8 +154,13 @@ func (r *AdmissionPolicy) GetPolicyServer() string {
 	return r.Spec.PolicyServer
 }
 
+// GetUniqueName returns the cluster-wide unique identity of the policy.
+// The `.` delimiter guarantees that two distinct policies can never collide:
+// namespaces cannot contain dots, and the kind token (`ap`) is dot-free and
+// unique per policy kind. Policy names may contain dots, but they are the
+// trailing remainder of the string, so the encoding stays unambiguous.
 func (r *AdmissionPolicy) GetUniqueName() string {
-	return "namespaced-" + r.Namespace + "-" + r.Name
+	return "kw.ap." + r.Namespace + "." + r.Name
 }
 
 func (r *AdmissionPolicy) GetContextAwareResources() []ContextAwareResource {

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -45,12 +46,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/api/policies/v1alpha2"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
-	"github.com/kubewarden/kubewarden-controller/internal/controller"
-	"github.com/kubewarden/kubewarden-controller/internal/featuregates"
-	"github.com/kubewarden/kubewarden-controller/internal/metrics"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/api/policies/v1alpha2"
+	"github.com/kubewarden/adm-controller/internal/cleanup"
+	"github.com/kubewarden/adm-controller/internal/constants"
+	"github.com/kubewarden/adm-controller/internal/controller"
+	"github.com/kubewarden/adm-controller/internal/featuregates"
+	"github.com/kubewarden/adm-controller/internal/metrics"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -61,6 +63,11 @@ import (
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch,namespace="kubewarden"
 //+kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
 //+kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
+
+const (
+	minAllowedPort = 1
+	maxAllowedPort = 65535
+)
 
 //nolint:gochecknoglobals // Following the kubebuilder pattern
 var (
@@ -74,14 +81,22 @@ type ManagerOptions struct {
 	EnableMutualTLS      bool
 	MetricsAddr          string
 	ProbeAddr            string
+	WebhookServerPort    int
 }
 
 type Configuration struct {
 	AlwaysAcceptAdmissionReviewsOnDeploymentsNamespace bool
 	ClientCAConfigMapName                              string
+	DefaultsConfigMapName                              string
+	ControllerConfigMapName                            string
 	FeatureGateAdmissionWebhookMatchConditions         bool
 	WebhookServiceName                                 string
 	ImagePullSecrets                                   []corev1.LocalObjectReference
+	// HostNetwork enables host network mode for PolicyServer deployments.
+	// WARNING: enabling this increases the attack surface. Use only when
+	// the Kubernetes API server cannot reach pod-network webhook endpoints
+	// (e.g. clusters using a non-VPC CNI with NAT).
+	HostNetwork bool
 }
 
 func init() {
@@ -91,7 +106,7 @@ func init() {
 	//+kubebuilder:scaffold:scheme
 }
 
-//nolint:funlen // Avoid splitting the main function in multiple functions to avoid changing the retcode logic for metrics shutdown
+//nolint:funlen,gocognit // Avoid splitting the main function in multiple functions to avoid changing the retcode logic for metrics shutdown
 func main() {
 	retcode := 0
 	defer func() { os.Exit(retcode) }()
@@ -104,9 +119,12 @@ func main() {
 	var openTelemetryClientCertificateSecret string
 	var openTelemetryCertificateSecret string
 	var imagePullSecretsFlag string
+	var cleanupMode bool
+	var controllerDeploymentName string
 
-	flag.StringVar(&mgrOpts.MetricsAddr, "metrics-bind-address", ":8088", "The address the metric endpoint binds to.")
+	flag.StringVar(&mgrOpts.MetricsAddr, "metrics-bind-address", ":8088", "The address the controller-runtime metric endpoint binds to.")
 	flag.StringVar(&mgrOpts.ProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.IntVar(&mgrOpts.WebhookServerPort, "webhook-server-port", 9443, "The port the webhook server listens on.")
 	flag.BoolVar(&mgrOpts.EnableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -131,10 +149,37 @@ func main() {
 		false,
 		"Always accept admission reviews targeting the deployments-namespace.")
 	flag.StringVar(&config.ClientCAConfigMapName, "client-ca-configmap-name", "", "The name of the ConfigMap containing the client CA certificate. If provided, mTLS will be enabled.")
+	flag.StringVar(&config.DefaultsConfigMapName,
+		"defaults-configmap-name",
+		constants.DefaultDefaultsConfigMapName,
+		"Name of the ConfigMap that holds the rendered default Kubewarden resources.")
+	flag.StringVar(&config.ControllerConfigMapName,
+		"controller-configmap-name",
+		constants.DefaultControllerConfigMapName,
+		"Name of the ConfigMap that holds the controller configuration, for example the resources that namespaced policies can target. The ConfigMap must be in the deployments namespace.")
 	flag.StringVar(&imagePullSecretsFlag,
 		"image-pull-secrets",
 		"",
 		"Comma-separated list of Secret names to use as imagePullSecrets on every policy-server Deployment. The secrets must exist in the deployments namespace.")
+	flag.BoolVar(&config.HostNetwork,
+		"host-network",
+		false,
+		"Enable host network mode for all PolicyServer deployments. "+
+			"WARNING: enabling this increases the attack surface by exposing webhook endpoints "+
+			"on the host network and giving pods visibility of all node network interfaces. "+
+			"Use only when the Kubernetes API server cannot reach pod-network webhook endpoints.")
+	flag.BoolVar(&cleanupMode,
+		"cleanup",
+		false,
+		"Run in cleanup mode instead of starting the controller manager. "+
+			"Used by the Helm chart pre-delete hook: deletes the controller Deployment, "+
+			"the Kubewarden webhook configurations, the chart-managed default resources and "+
+			"the resources backing the policy servers, and strips the Kubewarden finalizers "+
+			"from the kept Kubewarden custom resources.")
+	flag.StringVar(&controllerDeploymentName,
+		"controller-deployment-name",
+		"",
+		"The name of the controller Deployment to delete in cleanup mode.")
 
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
@@ -142,6 +187,72 @@ func main() {
 	mgrOpts.EnableMutualTLS = config.ClientCAConfigMapName != ""
 	config.ImagePullSecrets = parseImagePullSecrets(imagePullSecretsFlag)
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if cleanupMode {
+		if err := runCleanup(mgrOpts.DeploymentsNamespace, controllerDeploymentName); err != nil {
+			setupLog.Error(err, "cleanup failed")
+			retcode = 1
+		}
+		return
+	}
+
+	// Validate --webhook-server-port range.
+	if int64(mgrOpts.WebhookServerPort) < minAllowedPort || int64(mgrOpts.WebhookServerPort) > maxAllowedPort {
+		setupLog.Error(
+			errors.New("port must be between 1 and 65535"),
+			"invalid webhook server port",
+			"flag", "--webhook-server-port",
+			"value", mgrOpts.WebhookServerPort,
+			"min", minAllowedPort,
+			"max", maxAllowedPort,
+		)
+		retcode = 1
+		return
+	}
+
+	// HostNetwork mode is incompatible with OTel sidecar injection because
+	// multiple sidecars on the same node would cause port conflicts.
+	if config.HostNetwork && enableOtelSidecar {
+		setupLog.Error(
+			errors.New("--host-network and --enable-otel-sidecar are mutually exclusive"),
+			"incompatible flags: OpenTelemetry sidecar injection is not supported in host-network mode due to port conflicts; use a remote collector instead",
+		)
+		retcode = 1
+		return
+	}
+
+	// Warn when hostNetwork is enabled
+	if config.HostNetwork {
+		setupLog.Info("WARNING: enabling host-network increases the attack surface by exposing webhook endpoints " +
+			"on the host network and giving pods visibility of all node network interfaces. " +
+			"Use only when the Kubernetes API server cannot reach pod-network webhook endpoints.")
+	}
+
+	// Read the global default metrics port for PolicyServer services from the
+	// environment variable, falling back to the hardcoded constant.
+	policyServerMetricsPort := int32(constants.PolicyServerMetricsPort)
+	if envPort := os.Getenv(constants.PolicyServerMetricsPortEnvVar); envPort != "" {
+		parsed, err := strconv.ParseInt(envPort, 10, 32)
+		if err != nil {
+			setupLog.Error(err, "cannot parse env var as integer port",
+				"envVar", constants.PolicyServerMetricsPortEnvVar, "value", envPort)
+			retcode = 1
+			return
+		}
+		if parsed < minAllowedPort || parsed > maxAllowedPort {
+			setupLog.Error(
+				errors.New("port must be between 1 and 65535"),
+				"invalid env var port value",
+				"envVar", constants.PolicyServerMetricsPortEnvVar,
+				"value", envPort,
+				"min", minAllowedPort,
+				"max", maxAllowedPort,
+			)
+			retcode = 1
+			return
+		}
+		policyServerMetricsPort = int32(parsed)
+	}
 
 	if enableMetrics {
 		shutdown, err := metrics.New()
@@ -189,6 +300,7 @@ func main() {
 		mgrOpts.DeploymentsNamespace,
 		config,
 		otelConfiguration,
+		policyServerMetricsPort,
 	); err != nil {
 		setupLog.Error(err, "unable to create controllers")
 		retcode = 1
@@ -215,6 +327,32 @@ func main() {
 		retcode = 1
 		return
 	}
+}
+
+// runCleanup runs the uninstall cleanup performed by the Helm chart
+// pre-delete hook, using a plain client instead of a manager: no leader
+// election, no webhook server, no metrics.
+func runCleanup(deploymentsNamespace, controllerDeploymentName string) error {
+	if deploymentsNamespace == "" {
+		return errors.New("--deployments-namespace must be provided in cleanup mode")
+	}
+	if controllerDeploymentName == "" {
+		return errors.New("--controller-deployment-name must be provided in cleanup mode")
+	}
+
+	k8sClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	if err != nil {
+		return fmt.Errorf("failed to create the client: %w", err)
+	}
+
+	err = cleanup.Run(ctrl.SetupSignalHandler(), k8sClient, ctrl.Log.WithName("cleanup"), cleanup.Options{
+		DeploymentsNamespace:     deploymentsNamespace,
+		ControllerDeploymentName: controllerDeploymentName,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to run the cleanup: %w", err)
+	}
+	return nil
 }
 
 func setupManager(mgrOpts ManagerOptions) (ctrl.Manager, error) {
@@ -275,6 +413,7 @@ func setupManager(mgrOpts ManagerOptions) (ctrl.Manager, error) {
 		},
 		WebhookServer: webhook.NewServer(webhook.Options{
 			ClientCAName: clientCAName,
+			Port:         mgrOpts.WebhookServerPort,
 		}),
 	}
 
@@ -299,6 +438,7 @@ func setupReconcilers(mgr ctrl.Manager,
 	deploymentsNamespace string,
 	config Configuration,
 	otelConfiguration controller.TelemetryConfiguration,
+	policyServerMetricsPort int32,
 ) error {
 	if err := (&controller.PolicyServerReconciler{
 		Client:               mgr.GetClient(),
@@ -308,16 +448,20 @@ func setupReconcilers(mgr ctrl.Manager,
 		AlwaysAcceptAdmissionReviewsInDeploymentsNamespace: config.AlwaysAcceptAdmissionReviewsOnDeploymentsNamespace,
 		TelemetryConfiguration:                             otelConfiguration,
 		ClientCAConfigMapName:                              config.ClientCAConfigMapName,
+		ControllerConfigMapName:                            config.ControllerConfigMapName,
 		ImagePullSecrets:                                   config.ImagePullSecrets,
+		HostNetwork:                                        config.HostNetwork,
+		PolicyServerMetricsPort:                            policyServerMetricsPort,
 	}).SetupWithManager(mgr); err != nil {
 		return errors.Join(errors.New("unable to create PolicyServer controller"), err)
 	}
 
 	if err := (&controller.AdmissionPolicyReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Log:                  ctrl.Log.WithName("admission-policy-reconciler"),
-		DeploymentsNamespace: deploymentsNamespace,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Log:                     ctrl.Log.WithName("admission-policy-reconciler"),
+		DeploymentsNamespace:    deploymentsNamespace,
+		ControllerConfigMapName: config.ControllerConfigMapName,
 		FeatureGateAdmissionWebhookMatchConditions: config.FeatureGateAdmissionWebhookMatchConditions,
 	}).SetupWithManager(mgr); err != nil {
 		return errors.Join(errors.New("unable to create AdmissionPolicy controller"), err)
@@ -345,10 +489,11 @@ func setupReconcilers(mgr ctrl.Manager,
 	}
 
 	if err := (&controller.AdmissionPolicyGroupReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Log:                  ctrl.Log.WithName("admission-policy-group-reconciler"),
-		DeploymentsNamespace: deploymentsNamespace,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Log:                     ctrl.Log.WithName("admission-policy-group-reconciler"),
+		DeploymentsNamespace:    deploymentsNamespace,
+		ControllerConfigMapName: config.ControllerConfigMapName,
 		FeatureGateAdmissionWebhookMatchConditions: config.FeatureGateAdmissionWebhookMatchConditions,
 	}).SetupWithManager(mgr); err != nil {
 		return errors.Join(errors.New("unable to create AdmissionPolicyGroup controller"), err)
@@ -362,6 +507,16 @@ func setupReconcilers(mgr ctrl.Manager,
 		FeatureGateAdmissionWebhookMatchConditions: config.FeatureGateAdmissionWebhookMatchConditions,
 	}).SetupWithManager(mgr); err != nil {
 		return errors.Join(errors.New("unable to create ClusterAdmissionPolicyGroup controller"), err)
+	}
+
+	if err := (&controller.DefaultsApplierReconciler{
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Log:                  ctrl.Log.WithName("defaults-applier"),
+		DeploymentsNamespace: deploymentsNamespace,
+		ConfigMapName:        config.DefaultsConfigMapName,
+	}).SetupWithManager(mgr); err != nil {
+		return errors.Join(errors.New("unable to create DefaultsApplier controller"), err)
 	}
 	return nil
 }

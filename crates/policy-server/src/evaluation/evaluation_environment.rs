@@ -3,6 +3,8 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use mockall::automock;
 use policy_evaluator::{
     admission_response::AdmissionResponse,
     admission_response_handler::{
@@ -15,7 +17,7 @@ use policy_evaluator::{
     host_capabilities::HostCapabilities,
     kubewarden_policy_sdk::settings::SettingsValidationResponse,
     policy_evaluator::{PolicyEvaluator, PolicyEvaluatorPre, PolicyExecutionMode, ValidateRequest},
-    policy_evaluator_builder::PolicyEvaluatorBuilder,
+    policy_evaluator_builder::{PolicyEvaluatorBuilder, ResourceLimits},
     policy_group_evaluator::{PolicyGroupMemberSettings, evaluator::PolicyGroupEvaluator},
     policy_metadata::ContextAwareResource,
     wasmtime,
@@ -31,11 +33,23 @@ use crate::{
     },
 };
 
-#[cfg(test)]
-use mockall::automock;
-
 /// The digest of a WebAssembly module
 type ModuleDigest = String;
+
+/// Resolve the epoch deadline (in ticks) to use for a policy evaluation.
+///
+/// A policy's own `timeout_eval_seconds` only takes effect as an override of
+/// the server-wide `global_policy_evaluation_limit_seconds`: when the global
+/// timeout protection is disabled (`global_policy_evaluation_limit_seconds`
+/// is `None`), Wasmtime epoch interruption is not enabled on the shared
+/// engine at all, so `timeoutEvalSeconds` is ignored and no deadline is set
+/// (a startup warning is emitted for this case, see `lib.rs`).
+fn epoch_deadline_for(
+    timeout_eval_seconds: Option<u64>,
+    global_policy_evaluation_limit_seconds: Option<u64>,
+) -> Option<u64> {
+    global_policy_evaluation_limit_seconds.map(|global| timeout_eval_seconds.unwrap_or(global))
+}
 
 /// This structure contains all the policies defined by the user inside of the `policies.yml`.
 /// It also provides helper methods to perform the validation of a request and the validation
@@ -102,6 +116,10 @@ pub(crate) struct EvaluationEnvironment {
 
     /// When set, defines after how many seconds a policy evaluation is interrupted.
     global_policy_evaluation_limit_seconds: Option<u64>,
+
+    /// When set, defines the maximum amount of linear memory, in bytes, that
+    /// each policy is allowed to use.
+    policy_memory_limit_bytes: Option<usize>,
 }
 
 /// This structure is used to build the `EvaluationEnvironment` instance.
@@ -111,6 +129,7 @@ pub(crate) struct EvaluationEnvironmentBuilder<'engine, 'precompiled_policies> {
     callback_handler_tx: mpsc::Sender<CallbackRequest>,
     continue_on_errors: bool,
     global_policy_evaluation_limit_seconds: Option<u64>,
+    policy_memory_limit_bytes: Option<usize>,
     always_accept_admission_reviews_on_namespace: Option<String>,
 }
 
@@ -127,6 +146,7 @@ impl<'engine, 'precompiled_policies> EvaluationEnvironmentBuilder<'engine, 'prec
             callback_handler_tx,
             continue_on_errors: false,
             global_policy_evaluation_limit_seconds: None,
+            policy_memory_limit_bytes: None,
             always_accept_admission_reviews_on_namespace: None,
         }
     }
@@ -137,6 +157,13 @@ impl<'engine, 'precompiled_policies> EvaluationEnvironmentBuilder<'engine, 'prec
         policy_evaluation_limit_seconds: u64,
     ) -> Self {
         self.global_policy_evaluation_limit_seconds = Some(policy_evaluation_limit_seconds);
+        self
+    }
+
+    /// Enable enforcement of a maximum amount of linear memory, in bytes,
+    /// that each policy is allowed to use.
+    pub fn with_policy_memory_limit(mut self, policy_memory_limit_bytes: usize) -> Self {
+        self.policy_memory_limit_bytes = Some(policy_memory_limit_bytes);
         self
     }
 
@@ -183,6 +210,7 @@ impl<'engine, 'precompiled_policies> EvaluationEnvironmentBuilder<'engine, 'prec
                 .clone(),
             callback_handler_tx: Some(self.callback_handler_tx.clone()),
             global_policy_evaluation_limit_seconds: self.global_policy_evaluation_limit_seconds,
+            policy_memory_limit_bytes: self.policy_memory_limit_bytes,
             ..Default::default()
         };
 
@@ -224,8 +252,10 @@ impl<'engine, 'precompiled_policies> EvaluationEnvironmentBuilder<'engine, 'prec
                         timeout_eval_seconds: timeout_eval_seconds.to_owned(),
                     };
 
-                    let epoch_deadline =
-                        timeout_eval_seconds.or(self.global_policy_evaluation_limit_seconds);
+                    let epoch_deadline = epoch_deadline_for(
+                        timeout_eval_seconds.to_owned(),
+                        self.global_policy_evaluation_limit_seconds,
+                    );
 
                     let host_capabilities =
                         HostCapabilities::new(host_capabilities).map_err(|e| {
@@ -300,9 +330,10 @@ impl<'engine, 'precompiled_policies> EvaluationEnvironmentBuilder<'engine, 'prec
                             timeout_eval_seconds: policy.timeout_eval_seconds,
                         };
 
-                        let epoch_deadline = policy
-                            .timeout_eval_seconds
-                            .or(self.global_policy_evaluation_limit_seconds);
+                        let epoch_deadline = epoch_deadline_for(
+                            policy.timeout_eval_seconds,
+                            self.global_policy_evaluation_limit_seconds,
+                        );
 
                         let host_capabilities = HostCapabilities::new(
                             policy.host_capabilities.clone(),
@@ -404,7 +435,6 @@ impl EvaluationEnvironment {
     ///
     /// Invariants that are not in params:
     /// - `module_digest`: obtained from `precompiled_policy.digest`
-    /// - `evaluation_limit_seconds`: obtained from `eval_ctx.epoch_deadline`
     fn register(
         &mut self,
         engine: &wasmtime::Engine,
@@ -426,7 +456,7 @@ impl EvaluationEnvironment {
                 engine,
                 &module,
                 precompiled_policy.execution_mode,
-                eval_ctx.epoch_deadline,
+                self.policy_memory_limit_bytes,
             )?;
 
             self.module_digest_to_policy_evaluator_pre
@@ -554,9 +584,10 @@ impl EvaluationEnvironment {
 
         let policy_settings = self.get_policy_settings(policy_id)?;
 
-        let epoch_deadline = policy_settings
-            .timeout_eval_seconds
-            .or(self.global_policy_evaluation_limit_seconds);
+        let epoch_deadline = epoch_deadline_for(
+            policy_settings.timeout_eval_seconds,
+            self.global_policy_evaluation_limit_seconds,
+        );
 
         let policy_evaluator_pre = self
             .module_digest_to_policy_evaluator_pre
@@ -686,9 +717,10 @@ impl EvaluationEnvironment {
                 _ => unreachable!(),
             };
 
-            let epoch_deadline = policy_settings
-                .timeout_eval_seconds
-                .or(self.global_policy_evaluation_limit_seconds);
+            let epoch_deadline = epoch_deadline_for(
+                policy_settings.timeout_eval_seconds,
+                self.global_policy_evaluation_limit_seconds,
+            );
 
             let policy_group_member_settings = PolicyGroupMemberSettings {
                 settings,
@@ -725,22 +757,36 @@ fn create_wasmtime_module(
         })
 }
 
-/// Internal function, takes care of creating the `PolicyEvaluator` instance for the given policy
+/// Internal function, takes care of creating the `PolicyEvaluator` instance for the given policy.
+///
+/// Note: this does not configure Wasmtime epoch interruption. An `engine` is
+/// always supplied by the caller (see `PolicyServer::new_from_config`), and
+/// `PolicyEvaluatorBuilder::build_engine` only applies epoch-interruption
+/// settings when it builds its own engine, so calling
+/// `enable_epoch_interruptions` here would have no effect. The engine's
+/// epoch-interruption setting is decided once in `lib.rs`; the per-evaluation
+/// deadline is applied later, via `EvaluationContext::epoch_deadline`
+/// (see `epoch_deadline_for`).
+///
+/// Unlike the epoch deadline, `policy_memory_limit_bytes` is applied here,
+/// at `PolicyEvaluatorPre` build time: it's baked into the `ResourceLimits`
+/// used by every `wasmtime::Store` created out of the resulting `Pre`
+/// instance (via `PolicyEvaluatorBuilder::enable_resource_limits`), so there
+/// is no per-evaluation override.
 fn create_policy_evaluator_pre(
     engine: &wasmtime::Engine,
     module: &wasmtime::Module,
     mode: PolicyExecutionMode,
-    policy_evaluation_limit_seconds: Option<u64>,
+    policy_memory_limit_bytes: Option<usize>,
 ) -> Result<PolicyEvaluatorPre> {
-    let mut policy_evaluator_builder = PolicyEvaluatorBuilder::new()
+    let policy_evaluator_builder = PolicyEvaluatorBuilder::new()
         .engine(engine.to_owned())
         .policy_module(module.to_owned())
-        .execution_mode(mode);
-
-    if let Some(limit) = policy_evaluation_limit_seconds {
-        policy_evaluator_builder =
-            policy_evaluator_builder.enable_epoch_interruptions(limit, limit);
-    }
+        .execution_mode(mode)
+        .enable_resource_limits(ResourceLimits {
+            max_memory_size: policy_memory_limit_bytes,
+            max_table_elements: None,
+        });
 
     policy_evaluator_builder.build_pre().map_err(|e| {
         EvaluationError::WebAssemblyError(format!("cannot build PolicyEvaluatorPre {e}"))
@@ -756,8 +802,10 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::config::{PolicyGroupMember, PolicyOrPolicyGroup};
-    use crate::test_utils::build_admission_review_request;
+    use crate::{
+        config::{PolicyGroupMember, PolicyOrPolicyGroup},
+        test_utils::build_admission_review_request,
+    };
 
     /// build a precompiled policy of the given wasm module. Assumes this is a OPA Gatekeeper policy
     fn build_precompiled_policy(

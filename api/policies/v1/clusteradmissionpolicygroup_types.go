@@ -41,45 +41,45 @@ type ClusterAdmissionPolicyGroupSpec struct {
 	// object itself is a namespace, the matching is performed on
 	// object.metadata.labels. If the object is another cluster scoped resource,
 	// it never skips the webhook.
-	// <br/><br/>
-	// For example, to run the webhook on any objects whose namespace is not
-	// associated with "runlevel" of "0" or "1";  you will set the selector as
-	// follows:
-	// <pre>
-	// "namespaceSelector": \{<br/>
-	// &nbsp;&nbsp;"matchExpressions": [<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;\{<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"key": "runlevel",<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"operator": "NotIn",<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"values": [<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"0",<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"1"<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;]<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;\}<br/>
-	// &nbsp;&nbsp;]<br/>
-	// \}
-	// </pre>
-	// If instead you want to only run the webhook on any objects whose
-	// namespace is associated with the "environment" of "prod" or "staging";
-	// you will set the selector as follows:
-	// <pre>
-	// "namespaceSelector": \{<br/>
-	// &nbsp;&nbsp;"matchExpressions": [<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;\{<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"key": "environment",<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"operator": "In",<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"values": [<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"prod",<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"staging"<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;]<br/>
-	// &nbsp;&nbsp;&nbsp;&nbsp;\}<br/>
-	// &nbsp;&nbsp;]<br/>
-	// \}
-	// </pre>
+	//
+	// For example, to run the webhook on objects whose namespace does not have
+	// a runlevel of 0 or 1, use this selector:
+	//
+	// ```json
+	// {
+	//   "namespaceSelector": {
+	//     "matchExpressions": [
+	//       {
+	//         "key": "runlevel",
+	//         "operator": "NotIn",
+	//         "values": ["0", "1"]
+	//       }
+	//     ]
+	//   }
+	// }
+	// ```
+	//
+	// To run the webhook only on objects whose namespace has an environment of
+	// prod or staging, use this selector:
+	//
+	// ```json
+	// {
+	//   "namespaceSelector": {
+	//     "matchExpressions": [
+	//       {
+	//         "key": "environment",
+	//         "operator": "In",
+	//         "values": ["prod", "staging"]
+	//       }
+	//     ]
+	//   }
+	// }
+	// ```
+	//
 	// See
 	// https://kubernetes.io/docs/concepts/overview/working-with-objects/labels
 	// for more examples of label selectors.
-	// <br/><br/>
+	//
 	// Default to the empty LabelSelector, which matches everything.
 	// +optional
 	NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
@@ -101,6 +101,7 @@ type ClusterAdmissionPolicyGroupSpec struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=capg
 // +kubebuilder:storageversion
+// +kubebuilder:metadata:annotations="helm.sh/resource-policy=keep"
 // +kubebuilder:printcolumn:name="Policy Server",type=string,JSONPath=`.spec.policyServer`,description="Bound to Policy Server"
 // +kubebuilder:printcolumn:name="Mutating",type=boolean,JSONPath=`.spec.mutating`,description="Whether the policy is mutating"
 // +kubebuilder:printcolumn:name="BackgroundAudit",type=boolean,JSONPath=`.spec.backgroundAudit`,description="Whether the policy is used in audit checks"
@@ -124,10 +125,6 @@ type ClusterAdmissionPolicyGroupList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ClusterAdmissionPolicyGroup `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&ClusterAdmissionPolicyGroup{}, &ClusterAdmissionPolicyGroupList{})
 }
 
 func (r *ClusterAdmissionPolicyGroup) SetStatus(status PolicyStatusEnum) {
@@ -234,8 +231,11 @@ func (r *ClusterAdmissionPolicyGroup) GetPolicyServer() string {
 	return r.Spec.PolicyServer
 }
 
+// GetUniqueName returns the cluster-wide unique identity of the policy.
+// The `.` delimiter and the dot-free, kind-unique token (`capg`) guarantee
+// that two distinct policies can never collide, regardless of their kind.
 func (r *ClusterAdmissionPolicyGroup) GetUniqueName() string {
-	return "clusterwide-group-" + r.Name
+	return "kw.capg." + r.Name
 }
 
 func (r *ClusterAdmissionPolicyGroup) GetContextAwareResources() []ContextAwareResource {

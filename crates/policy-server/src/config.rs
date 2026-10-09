@@ -24,6 +24,7 @@ use serde::Deserialize;
 
 pub static SERVICE_NAME: &str = "kubewarden-policy-server";
 const DOCKER_CONFIG_ENV_VAR: &str = "DOCKER_CONFIG";
+const BYTES_PER_MIB: usize = 1024 * 1024;
 
 lazy_static! {
     pub(crate) static ref HOSTNAME: String =
@@ -40,6 +41,9 @@ pub struct Config {
     pub always_accept_admission_reviews_on_namespace: Option<String>,
     // This is the global timeout for each policy evaluation.
     pub policy_evaluation_limit_seconds: Option<u64>,
+    // This is the global limit, expressed in bytes, applied to the linear memory of
+    // each policy.
+    pub policy_memory_limit_bytes: Option<usize>,
     pub tls_config: Option<TlsConfig>,
     pub pool_size: usize,
     pub metrics_enabled: bool,
@@ -86,6 +90,24 @@ impl Config {
                     .expect("policy-timeout should always be set")
                     .parse::<u64>()?,
             )
+        };
+        let policy_memory_limit_bytes = if *matches
+            .get_one::<bool>("disable-memory-limit")
+            .expect("clap should have set a default value")
+        {
+            None
+        } else {
+            let policy_memory_limit_mib = matches
+                .get_one::<String>("policy-memory-limit")
+                .expect("policy-memory-limit should always be set")
+                .parse::<usize>()?;
+            if policy_memory_limit_mib == 0 {
+                return Err(anyhow!(
+                    "policy-memory-limit must be greater than 0, or the limit must be disabled \
+                     via --disable-memory-limit"
+                ));
+            }
+            Some(policy_memory_limit_mib * BYTES_PER_MIB)
         };
         let sources = remote_server_options(matches)?;
         let pool_size = matches
@@ -160,6 +182,7 @@ impl Config {
             tls_config,
             always_accept_admission_reviews_on_namespace,
             policy_evaluation_limit_seconds,
+            policy_memory_limit_bytes,
             pool_size,
             metrics_enabled,
             sigstore_cache_dir,
@@ -323,7 +346,10 @@ pub struct PolicyGroupMember {
     /// The list of Kubernetes resources the policy is allowed to access
     #[serde(default)]
     pub context_aware_resources: BTreeSet<ContextAwareResource>,
-    /// Timeout for the evaluation of the policy
+    /// Timeout for the evaluation of the policy. Overrides the server-wide
+    /// `policy_evaluation_limit_seconds` for this policy. Only takes effect
+    /// when timeout protection is enabled (i.e. `--disable-timeout-protection`
+    /// is not set); it is ignored otherwise.
     pub timeout_eval_seconds: Option<u64>,
     /// List of host capabilities granted to this policy
     #[serde(default)]
@@ -359,7 +385,10 @@ pub enum PolicyOrPolicyGroup {
         context_aware_resources: BTreeSet<ContextAwareResource>,
         /// The message that is returned when the policy evaluates to false
         message: Option<String>,
-        /// Timeout for the evaluation of the policy
+        /// Timeout for the evaluation of the policy. Overrides the server-wide
+        /// `policy_evaluation_limit_seconds` for this policy. Only takes effect
+        /// when timeout protection is enabled (i.e. `--disable-timeout-protection`
+        /// is not set); it is ignored otherwise.
         timeout_eval_seconds: Option<u64>,
         /// The list of host capabilities granted to this policy
         #[serde(default)]
@@ -399,6 +428,26 @@ impl PolicyOrPolicyGroup {
             }),
         }
     }
+}
+
+/// Returns `true` when at least one policy, or policy-group member, defines
+/// `timeoutEvalSeconds`.
+///
+/// `timeoutEvalSeconds` only takes effect as an override of the server-wide
+/// `policy_evaluation_limit_seconds`; when the global timeout protection is
+/// disabled (e.g. `--disable-timeout-protection`), per-policy timeouts are
+/// ignored. This helper is used to warn the operator when that combination
+/// is detected at startup.
+pub(crate) fn any_policy_has_timeout(policies: &HashMap<String, PolicyOrPolicyGroup>) -> bool {
+    policies.values().any(|policy| match policy {
+        PolicyOrPolicyGroup::Policy {
+            timeout_eval_seconds,
+            ..
+        } => timeout_eval_seconds.is_some(),
+        PolicyOrPolicyGroup::PolicyGroup { policies, .. } => policies
+            .values()
+            .any(|member| member.timeout_eval_seconds.is_some()),
+    })
 }
 
 /// Reads the policies configuration file, returns a HashMap with String as value
@@ -456,12 +505,14 @@ pub fn build_client_tls_config_from_env(prefix: &str) -> Result<ClientTlsConfig>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli;
+    use std::io::Write;
+
     use rstest::*;
     use serde_json::json;
-    use std::io::Write;
     use tempfile::NamedTempFile;
+
+    use super::*;
+    use crate::cli;
 
     #[test]
     fn read_policies_file_test() {
@@ -642,6 +693,39 @@ example:
         }
     }
 
+    fn config_with_policies_and_args(extra_args: &[&str]) -> Result<Config> {
+        let policies_yaml = r#"
+---
+example:
+  module: file:///tmp/namespace-validate-policy.wasm
+  settings: {}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(policies_yaml.as_bytes()).unwrap();
+        let file_path = temp_file.into_temp_path();
+        let policies_flag = format!("--policies={}", file_path.to_str().unwrap());
+
+        let mut args = vec!["policy-server", &policies_flag];
+        args.extend_from_slice(extra_args);
+
+        let matches = cli::build_cli().try_get_matches_from(args)?;
+        Config::from_args(&matches)
+    }
+
+    #[rstest]
+    #[case::default(&[], Some(256 * 1024 * 1024))]
+    #[case::custom_value(&["--policy-memory-limit=64"], Some(64 * 1024 * 1024))]
+    #[case::disabled(&["--disable-memory-limit"], None)]
+    fn policy_memory_limit_bytes(#[case] extra_args: &[&str], #[case] expected: Option<usize>) {
+        let config = config_with_policies_and_args(extra_args).unwrap();
+        assert_eq!(config.policy_memory_limit_bytes, expected);
+    }
+
+    #[test]
+    fn policy_memory_limit_rejects_zero() {
+        assert!(config_with_policies_and_args(&["--policy-memory-limit=0"]).is_err());
+    }
+
     #[rstest]
     #[case::all_good(
         r#"
@@ -696,5 +780,62 @@ group_policy:
 
         let validation_result = validate_policies(&policies);
         assert_eq!(is_valid, validation_result.is_ok());
+    }
+
+    #[test]
+    fn any_policy_has_timeout_empty() {
+        let policies: HashMap<String, PolicyOrPolicyGroup> = HashMap::new();
+        assert!(!any_policy_has_timeout(&policies));
+    }
+
+    #[rstest]
+    #[case::no_timeouts(
+        r#"
+---
+example:
+  module: file:///tmp/namespace-validate-policy.wasm
+  settings: {}
+group_policy:
+  expression: "true"
+  message: "group policy message"
+  policies:
+    policy1:
+      module: file:///tmp/namespace-validate-policy.wasm
+      settings: {}
+"#,
+        false
+    )]
+    #[case::policy_with_timeout(
+        r#"
+---
+example:
+  module: file:///tmp/namespace-validate-policy.wasm
+  settings: {}
+  timeoutEvalSeconds: 5
+"#,
+        true
+    )]
+    #[case::group_member_with_timeout(
+        r#"
+---
+group_policy:
+  expression: "true"
+  message: "group policy message"
+  policies:
+    policy1:
+      module: file:///tmp/namespace-validate-policy.wasm
+      settings: {}
+    policy2:
+      module: file:///tmp/namespace-validate-policy.wasm
+      settings: {}
+      timeoutEvalSeconds: 3
+"#,
+        true
+    )]
+    fn any_policy_has_timeout_detection(#[case] policies_yaml: &str, #[case] expected: bool) {
+        let policies: HashMap<String, PolicyOrPolicyGroup> =
+            serde_yaml::from_str(policies_yaml).unwrap();
+
+        assert_eq!(expected, any_policy_has_timeout(&policies));
     }
 }

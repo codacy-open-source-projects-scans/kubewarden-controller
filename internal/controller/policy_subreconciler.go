@@ -34,21 +34,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/go-logr/logr"
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
-	"github.com/kubewarden/kubewarden-controller/internal/metrics"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/constants"
+	"github.com/kubewarden/adm-controller/internal/metrics"
 )
 
 type policySubReconciler struct {
 	client.Client
 	Log                                        logr.Logger
 	deploymentsNamespace                       string
+	controllerConfigMapName                    string
 	featureGateAdmissionWebhookMatchConditions bool
 }
 
 func (r *policySubReconciler) reconcile(ctx context.Context, policy policiesv1.Policy) (ctrl.Result, error) {
 	if policy.GetDeletionTimestamp() != nil {
-		return r.reconcilePolicyDeletion(ctx, policy)
+		return ctrl.Result{}, r.removePolicyWebhooksAndFinalizers(ctx, policy)
 	}
 
 	reconcileResult, reconcileErr := r.reconcilePolicy(ctx, policy)
@@ -79,6 +80,14 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 			Message: "The policy webhook has not been created",
 		},
 	)
+	rejected, err := r.reconcileNamespacedPolicyAllowList(ctx, policy)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if rejected {
+		return ctrl.Result{}, nil
+	}
+
 	if policy.GetPolicyServer() == "" {
 		policy.SetStatus(policiesv1.PolicyStatusUnscheduled)
 		return ctrl.Result{}, nil
@@ -86,10 +95,12 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 
 	policyServer, err := r.getPolicyServer(ctx, policy)
 	if err != nil {
-		policy.SetStatus(policiesv1.PolicyStatusScheduled)
-		//nolint:nilerr // set status to scheduled if policyServer can't be retrieved, and stop reconciling
-		return ctrl.Result{}, nil
+		if errors.Is(err, errPolicyServerNotAvailable) {
+			return r.reconcilePolicyServerUnavailable(ctx, policy)
+		}
+		return ctrl.Result{}, err
 	}
+
 	if policy.GetStatus().PolicyStatus != policiesv1.PolicyStatusActive {
 		policy.SetStatus(policiesv1.PolicyStatusPending)
 	}
@@ -97,7 +108,7 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 	policyServerDeployment := appsv1.Deployment{}
 	if err = r.Get(ctx, types.NamespacedName{Namespace: r.deploymentsNamespace, Name: policyServerDeploymentName(policy.GetPolicyServer())}, &policyServerDeployment); err != nil {
 		if apierrors.IsNotFound(err) {
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // Keep Requeue, RequeueAfter doesn't do exponential back-off
 		}
 		return ctrl.Result{}, errors.Join(errors.New("could not read policy server Deployment"), err)
 	}
@@ -112,7 +123,7 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 				Message: "The latest replica set is not uniquely reachable",
 			},
 		)
-		return ctrl.Result{Requeue: true, RequeueAfter: constants.TimeToRequeuePolicyReconciliation}, nil
+		return ctrl.Result{Requeue: true, RequeueAfter: constants.TimeToRequeuePolicyReconciliation}, nil //nolint:staticcheck // Keep Requeue, RequeueAfter doesn't do exponential back-off
 	}
 
 	apimeta.SetStatusCondition(
@@ -130,41 +141,151 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 		return ctrl.Result{}, errors.Join(errors.New("cannot find policy server secret"), err)
 	}
 
-	if policy.IsMutating() {
-		if err = r.reconcileMutatingWebhookConfiguration(ctx, policy, &secret, policyServer.NameWithPrefix()); err != nil {
-			return ctrl.Result{}, errors.Join(errors.New("error reconciling mutating webhook"), err)
-		}
-	} else {
-		if err = r.reconcileValidatingWebhookConfiguration(ctx, policy, &secret, policyServer.NameWithPrefix()); err != nil {
-			return ctrl.Result{}, errors.Join(errors.New("error reconciling validating webhook"), err)
+	// Add the controller's finalizer here to avoid webhook orphans
+	if !controllerutil.ContainsFinalizer(policy, constants.KubewardenFinalizer) {
+		controllerutil.AddFinalizer(policy, constants.KubewardenFinalizer)
+		if err = r.Update(ctx, policy); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cannot add finalizer to policy: %w", err)
 		}
 	}
+
+	if err = r.reconcileWebhookConfiguration(ctx, policy, &secret, policyServer.NameWithPrefix()); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Remove the webhook configurations created with the legacy, ambiguous
+	// unique name by previous versions of the controller. This migration code
+	// can be safely removed after a few releases.
+	if err = r.reconcileLegacyWebhookConfigurationCleanup(ctx, policy); err != nil {
+		return ctrl.Result{}, errors.Join(errors.New("error cleaning up legacy webhook configurations"), err)
+	}
+
 	setPolicyAsActive(policy)
 
 	return ctrl.Result{}, nil
 }
 
-func (r *policySubReconciler) reconcilePolicyDeletion(ctx context.Context, policy policiesv1.Policy) (ctrl.Result, error) {
-	if policy.IsMutating() {
-		if err := r.reconcileMutatingWebhookConfigurationDeletion(ctx, policy); err != nil {
-			return ctrl.Result{}, err
-		}
-	} else {
-		if err := r.reconcileValidatingWebhookConfigurationDeletion(ctx, policy); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-	// Remove the old finalizer used to ensure that the policy server created
-	// before this controller version is delete as well. As the upgrade path
-	// supported by the Kubewarden project does not allow jumping versions, we
-	// can safely remove this line of code after a few releases.
-	controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizerPre114)
-	controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizer)
-	if err := r.Update(ctx, policy); err != nil {
-		return ctrl.Result{}, fmt.Errorf("cannot update admission policy: %w", err)
+// reconcileNamespacedPolicyAllowList makes sure that a namespaced policy
+// targets only the resources that the cluster administrator allows. When
+// the policy targets other resources, the function removes the webhook
+// configuration of the policy, sets the policy status to rejected and
+// returns true. Cluster-wide policies are always allowed.
+func (r *policySubReconciler) reconcileNamespacedPolicyAllowList(ctx context.Context, policy policiesv1.Policy) (bool, error) {
+	if policy.GetNamespace() == "" {
+		return false, nil
 	}
 
+	config, err := loadControllerConfig(ctx, r.Client, r.deploymentsNamespace, r.controllerConfigMapName, r.Log)
+	if err != nil {
+		return false, err
+	}
+	allowed := config.NamespacedPoliciesAllowedResources
+
+	isAllowed, disallowed := isNamespacedPolicyAllowed(policy, allowed)
+	if isAllowed {
+		return false, nil
+	}
+
+	r.Log.Info("namespaced policy targets resources that are not in the allow list, the policy is rejected",
+		"policy", policy.GetUniqueName(), "disallowedResources", disallowed)
+
+	// Remove the webhook configuration. A policy that was active before
+	// the cluster administrator changed the allow list must stop.
+	if err = r.removePolicyWebhooksAndFinalizers(ctx, policy); err != nil {
+		return false, err
+	}
+
+	policy.SetStatus(policiesv1.PolicyStatusRejected)
+	apimeta.SetStatusCondition(
+		&policy.GetStatus().Conditions,
+		metav1.Condition{
+			Type:    string(policiesv1.PolicyActive),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(policiesv1.PolicyReasonResourcesNotAllowed),
+			Message: namespacedPolicyRejectedMessage(disallowed, allowed, r.controllerConfigMapName),
+		},
+	)
+
+	return true, nil
+}
+
+// reconcilePolicyServerUnavailable handles the case where the PolicyServer is
+// confirmed missing or being deleted.
+// It removes the webhook configuration to prevent orphaned webhooks from blocking
+// admission requests, then sets the policy status as scheduled.
+func (r *policySubReconciler) reconcilePolicyServerUnavailable(ctx context.Context, policy policiesv1.Policy) (ctrl.Result, error) {
+	if err := r.removePolicyWebhooksAndFinalizers(ctx, policy); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	policy.SetStatus(policiesv1.PolicyStatusScheduled)
+
 	return ctrl.Result{}, nil
+}
+
+// reconcileWebhookConfiguration creates or patches the webhook configuration
+// for the policy, dispatching to the mutating or validating variant as needed.
+func (r *policySubReconciler) reconcileWebhookConfiguration(ctx context.Context, policy policiesv1.Policy, secret *corev1.Secret, policyServerName string) error {
+	if policy.IsMutating() {
+		if err := r.reconcileMutatingWebhookConfiguration(ctx, policy, secret, policyServerName); err != nil {
+			return errors.Join(errors.New("error reconciling mutating webhook"), err)
+		}
+		return nil
+	}
+	if err := r.reconcileValidatingWebhookConfiguration(ctx, policy, secret, policyServerName); err != nil {
+		return errors.Join(errors.New("error reconciling validating webhook"), err)
+	}
+	return nil
+}
+
+// deleteWebhookConfiguration removes the webhook configuration for the policy,
+// dispatching to the mutating or validating variant as needed.
+func (r *policySubReconciler) deleteWebhookConfiguration(ctx context.Context, policy policiesv1.Policy) error {
+	if policy.IsMutating() {
+		return r.reconcileMutatingWebhookConfigurationDeletion(ctx, policy)
+	}
+	return r.reconcileValidatingWebhookConfigurationDeletion(ctx, policy)
+}
+
+// removePolicyWebhooksAndFinalizers removes the webhook configurations, which
+// means that the policy can be safely deleted. Therefore, it also removes the
+// policy finalizers.
+func (r *policySubReconciler) removePolicyWebhooksAndFinalizers(ctx context.Context, policy policiesv1.Policy) error {
+	if err := r.deleteWebhookConfiguration(ctx, policy); err != nil {
+		return err
+	}
+
+	// Remove the webhook configurations created with the legacy, ambiguous
+	// unique name by previous versions of the controller, so that policies
+	// deleted before being reconciled by this version of the controller do
+	// not leave orphaned webhook configurations behind. This migration code
+	// can be safely removed after a few releases.
+	if err := r.reconcileLegacyWebhookConfigurationCleanup(ctx, policy); err != nil {
+		return err
+	}
+
+	finalizerRemoved := false
+	if controllerutil.ContainsFinalizer(policy, constants.KubewardenFinalizer) {
+		controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizer)
+		finalizerRemoved = true
+	}
+	// Remove the old finalizer used to ensure that the policy server created
+	// before this controller version is deleted as well.
+	// TODO:
+	// As the upgrade path supported by the Kubewarden project does not
+	// allow jumping versions, we can safely remove this line of code after a few
+	// releases.
+	if controllerutil.ContainsFinalizer(policy, constants.KubewardenFinalizerPre114) {
+		controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizerPre114)
+		finalizerRemoved = true
+	}
+	if finalizerRemoved {
+		if err := r.Update(ctx, policy); err != nil {
+			return fmt.Errorf("cannot update policy: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (r *policySubReconciler) setPolicyModeStatus(ctx context.Context, policy policiesv1.Policy) error {
@@ -202,10 +323,22 @@ func (r *policySubReconciler) setPolicyModeStatus(ctx context.Context, policy po
 	return nil
 }
 
+// errPolicyServerNotAvailable is returned by getPolicyServer when the
+// PolicyServer CR is confirmed to not exist or is being deleted. It is
+// distinct from transient API errors so callers can decide whether to clean up
+// webhook configurations or simply requeue.
+var errPolicyServerNotAvailable = errors.New("policy server not available")
+
 func (r *policySubReconciler) getPolicyServer(ctx context.Context, policy policiesv1.Policy) (*policiesv1.PolicyServer, error) {
 	policyServer := policiesv1.PolicyServer{}
 	if err := r.Get(ctx, types.NamespacedName{Name: policy.GetPolicyServer()}, &policyServer); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, errPolicyServerNotAvailable
+		}
 		return nil, errors.Join(errors.New("could not get policy server"), err)
+	}
+	if policyServer.DeletionTimestamp != nil {
+		return nil, errPolicyServerNotAvailable
 	}
 	return &policyServer, nil
 }
@@ -353,13 +486,101 @@ func findClusterPoliciesForPod(ctx context.Context, k8sClient client.Client, obj
 	return findClusterPoliciesForConfigMap(&configMap)
 }
 
+// findAdmissionPoliciesForPolicyServer maps a PolicyServer event to reconcile
+// requests for AdmissionPolicies that reference it by name.
+func findAdmissionPoliciesForPolicyServer(ctx context.Context, k8sClient client.Client, object client.Object) []reconcile.Request {
+	policyServer, ok := object.(*policiesv1.PolicyServer)
+	if !ok {
+		return []reconcile.Request{}
+	}
+
+	admissionPolicies := policiesv1.AdmissionPolicyList{}
+	if err := k8sClient.List(ctx, &admissionPolicies, client.MatchingFields{constants.PolicyServerIndexKey: policyServer.Name}); err != nil {
+		return []reconcile.Request{}
+	}
+
+	requests := make([]reconcile.Request, 0, len(admissionPolicies.Items))
+	for _, policy := range admissionPolicies.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: client.ObjectKey{Name: policy.Name, Namespace: policy.Namespace},
+		})
+	}
+	return requests
+}
+
+// findAdmissionPolicyGroupsForPolicyServer maps a PolicyServer event to
+// reconcile requests for all AdmissionPolicyGroups that reference it by name.
+func findAdmissionPolicyGroupsForPolicyServer(ctx context.Context, k8sClient client.Client, object client.Object) []reconcile.Request {
+	policyServer, ok := object.(*policiesv1.PolicyServer)
+	if !ok {
+		return []reconcile.Request{}
+	}
+
+	admissionPolicyGroups := policiesv1.AdmissionPolicyGroupList{}
+	if err := k8sClient.List(ctx, &admissionPolicyGroups, client.MatchingFields{constants.PolicyServerIndexKey: policyServer.Name}); err != nil {
+		return []reconcile.Request{}
+	}
+
+	requests := make([]reconcile.Request, 0, len(admissionPolicyGroups.Items))
+	for _, policy := range admissionPolicyGroups.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: client.ObjectKey{Name: policy.Name, Namespace: policy.Namespace},
+		})
+	}
+	return requests
+}
+
+// findClusterAdmissionPoliciesForPolicyServer maps a PolicyServer event to reconcile
+// requests for all ClusterAdmissionPolicies that reference it by name.
+func findClusterAdmissionPoliciesForPolicyServer(ctx context.Context, k8sClient client.Client, object client.Object) []reconcile.Request {
+	policyServer, ok := object.(*policiesv1.PolicyServer)
+	if !ok {
+		return []reconcile.Request{}
+	}
+
+	clusterAdmissionPolicies := policiesv1.ClusterAdmissionPolicyList{}
+	if err := k8sClient.List(ctx, &clusterAdmissionPolicies, client.MatchingFields{constants.PolicyServerIndexKey: policyServer.Name}); err != nil {
+		return []reconcile.Request{}
+	}
+
+	requests := make([]reconcile.Request, 0, len(clusterAdmissionPolicies.Items))
+	for _, policy := range clusterAdmissionPolicies.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: client.ObjectKey{Name: policy.Name},
+		})
+	}
+	return requests
+}
+
+// findClusterAdmissionPolicyGroupsForPolicyServer maps a PolicyServer event to reconcile
+// requests for all ClusterAdmissionPolicyGroups that reference it by name.
+func findClusterAdmissionPolicyGroupsForPolicyServer(ctx context.Context, k8sClient client.Client, object client.Object) []reconcile.Request {
+	policyServer, ok := object.(*policiesv1.PolicyServer)
+	if !ok {
+		return []reconcile.Request{}
+	}
+
+	clusterAdmissionPolicyGroups := policiesv1.ClusterAdmissionPolicyGroupList{}
+	if err := k8sClient.List(ctx, &clusterAdmissionPolicyGroups, client.MatchingFields{constants.PolicyServerIndexKey: policyServer.Name}); err != nil {
+		return []reconcile.Request{}
+	}
+
+	requests := make([]reconcile.Request, 0, len(clusterAdmissionPolicyGroups.Items))
+	for _, policy := range clusterAdmissionPolicyGroups.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: client.ObjectKey{Name: policy.Name},
+		})
+	}
+	return requests
+}
+
 func hasKubewardenLabel(labels map[string]string) bool {
 	// Pre v1.16.0
 	kubewardenLabel := labels["kubewarden"]
 	// From v1.16.0 on we are using the recommended label "app.kubernetes.io/part-of"
 	partOfLabel := labels[constants.PartOfLabelKey]
 
-	return kubewardenLabel == "true" || partOfLabel == constants.PartOfLabelValue
+	return kubewardenLabel == "true" || partOfLabel == constants.PartOfLabelValue //nolint:goconst
 }
 
 func getPolicyMapFromConfigMap(configMap *corev1.ConfigMap) (policyConfigEntryMap, error) {

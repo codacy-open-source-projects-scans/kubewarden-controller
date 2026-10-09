@@ -1,7 +1,9 @@
-use crate::errors::{BurregoError, Result};
 use core::fmt::Display;
-use regex::{Regex, escape as regex_escape};
 use std::{fmt, str::FromStr};
+
+use regex::{Regex, escape as regex_escape};
+
+use crate::errors::{BurregoError, Result};
 
 pub fn split(args: &[serde_json::Value]) -> Result<serde_json::Value> {
     if args.len() != 2 {
@@ -147,9 +149,9 @@ struct Expression {
 impl Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_regexp {
-            write!(f, "{}", &self.expression)
+            write!(f, "{}", self.expression)
         } else {
-            write!(f, "{}", &regex_escape(&self.expression))
+            write!(f, "{}", regex_escape(&self.expression))
         }
     }
 }

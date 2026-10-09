@@ -1,11 +1,15 @@
+use std::{path::PathBuf, str::FromStr};
+
 use anyhow::{Result, anyhow};
-use policy_evaluator::policy_evaluator::PolicyExecutionMode;
-use policy_evaluator::policy_fetcher::oci_client::Reference;
-use policy_evaluator::policy_fetcher::store::{Store, errors::StoreError};
+use policy_evaluator::{
+    policy_evaluator::PolicyExecutionMode,
+    policy_fetcher::{
+        oci_client::Reference,
+        store::{Store, errors::StoreError},
+    },
+};
 use regex::Regex;
 use serde_json::json;
-use std::path::PathBuf;
-use std::str::FromStr;
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
@@ -96,11 +100,13 @@ pub(crate) fn new_policy_execution_mode_from_str(name: &str) -> Result<PolicyExe
     let execution_mode: PolicyExecutionMode =
         serde_json::from_value(json!(name)).map_err(|_| {
             anyhow!(
-                "Unknown policy execution mode \"{}\". Valid values are {}, {}, {}",
+                "Unknown policy execution mode \"{}\". Valid values are {}, {}, {}, {}, {}",
                 name,
                 serde_json::to_string(&PolicyExecutionMode::KubewardenWapc).unwrap(),
                 serde_json::to_string(&PolicyExecutionMode::Opa).unwrap(),
                 serde_json::to_string(&PolicyExecutionMode::OpaGatekeeper).unwrap(),
+                serde_json::to_string(&PolicyExecutionMode::Wasi).unwrap(),
+                serde_json::to_string(&PolicyExecutionMode::Ferricel).unwrap(),
             )
         })?;
     Ok(execution_mode)

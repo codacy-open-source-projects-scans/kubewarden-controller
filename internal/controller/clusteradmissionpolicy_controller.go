@@ -31,8 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 // Warning: this controller is deployed by a helm chart which has its own
@@ -87,6 +87,10 @@ func (r *ClusterAdmissionPolicyReconciler) SetupWithManager(mgr ctrl.Manager) er
 			handler.EnqueueRequestsFromMapFunc(r.findClusterAdmissionPoliciesForPod),
 		).
 		Watches(
+			&policiesv1.PolicyServer{},
+			handler.EnqueueRequestsFromMapFunc(r.findClusterAdmissionPoliciesForPolicyServer),
+		).
+		Watches(
 			&admissionregistrationv1.ValidatingWebhookConfiguration{},
 			handler.EnqueueRequestsFromMapFunc(r.findClusterAdmissionPolicyForWebhookConfiguration),
 		).
@@ -103,6 +107,10 @@ func (r *ClusterAdmissionPolicyReconciler) SetupWithManager(mgr ctrl.Manager) er
 
 func (r *ClusterAdmissionPolicyReconciler) findClusterAdmissionPoliciesForPod(ctx context.Context, object client.Object) []reconcile.Request {
 	return findClusterPoliciesForPod(ctx, r.Client, object)
+}
+
+func (r *ClusterAdmissionPolicyReconciler) findClusterAdmissionPoliciesForPolicyServer(ctx context.Context, object client.Object) []reconcile.Request {
+	return findClusterAdmissionPoliciesForPolicyServer(ctx, r.Client, object)
 }
 
 func (r *ClusterAdmissionPolicyReconciler) findClusterAdmissionPolicyForWebhookConfiguration(_ context.Context, webhookConfiguration client.Object) []reconcile.Request {

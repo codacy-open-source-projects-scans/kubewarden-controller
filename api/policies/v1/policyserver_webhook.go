@@ -31,11 +31,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/go-logr/logr"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 // capabilityNode is a node in the host-capability path tree.
@@ -83,9 +82,6 @@ func (ps *PolicyServer) SetupWebhookWithManager(mgr ctrl.Manager, deploymentsNam
 	logger := mgr.GetLogger().WithName("policyserver-webhook")
 
 	err := ctrl.NewWebhookManagedBy(mgr, ps).
-		WithDefaulter(&policyServerDefaulter{
-			logger: logger,
-		}).
 		WithValidator(&policyServerValidator{
 			deploymentsNamespace: deploymentsNamespace,
 			k8sClient:            mgr.GetClient(),
@@ -94,24 +90,6 @@ func (ps *PolicyServer) SetupWebhookWithManager(mgr ctrl.Manager, deploymentsNam
 		Complete()
 	if err != nil {
 		return fmt.Errorf("failed enrolling webhook with manager: %w", err)
-	}
-
-	return nil
-}
-
-// +kubebuilder:webhook:path=/mutate-policies-kubewarden-io-v1-policyserver,mutating=true,failurePolicy=fail,sideEffects=None,groups=policies.kubewarden.io,resources=policyservers,verbs=create;update,versions=v1,name=mpolicyserver.kb.io,admissionReviewVersions={v1,v1beta1}
-
-// policyServerDefaulter sets defaults of PolicyServer objects when they are created or updated.
-type policyServerDefaulter struct {
-	logger logr.Logger
-}
-
-// Default implements webhook.CustomDefaulter so a webhook will be registered for the type.
-func (d *policyServerDefaulter) Default(_ context.Context, policyServer *PolicyServer) error {
-	d.logger.Info("Defaulting PolicyServer", "name", policyServer.GetName())
-
-	if policyServer.ObjectMeta.DeletionTimestamp == nil {
-		controllerutil.AddFinalizer(policyServer, constants.KubewardenFinalizer)
 	}
 
 	return nil
@@ -175,6 +153,7 @@ func (v *policyServerValidator) validate(ctx context.Context, policyServer *Poli
 
 	allErrs = append(allErrs, validateLimitsAndRequests(policyServer.Spec.Limits, policyServer.Spec.Requests)...)
 	allErrs = append(allErrs, validateNamespacedPoliciesCapabilities(policyServer.Spec.NamespacedPoliciesCapabilities)...)
+	allErrs = append(allErrs, v.validatePorts(policyServer)...)
 
 	if len(allErrs) == 0 {
 		return nil
@@ -274,7 +253,6 @@ func validateNamespacedPoliciesCapabilities(capabilities []string) field.ErrorLi
 			allErrs = append(allErrs, err)
 		}
 	}
-
 	return allErrs
 }
 
@@ -326,4 +304,25 @@ func validateSingleCapability(pattern string, path *field.Path) *field.Error {
 	return field.Invalid(path, pattern,
 		fmt.Sprintf("%q is not a complete capability path; use %q to allow all capabilities under it",
 			pattern, pattern+"/*"))
+}
+
+// validatePorts checks that the port fields in the PolicyServer spec do not
+// conflict with each other. Only pod-side ports (webhookPort, readinessProbePort)
+// are validated against each other. spec.metricsPort is a Service-layer-only
+// setting and cannot conflict with pod-side ports.
+func (v *policyServerValidator) validatePorts(policyServer *PolicyServer) field.ErrorList {
+	var allErrs field.ErrorList
+
+	webhookPort := policyServer.EffectiveWebhookPort()
+	readinessPort := policyServer.EffectiveReadinessProbePort()
+
+	if webhookPort == readinessPort {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec").Child("readinessProbePort"),
+			readinessPort,
+			fmt.Sprintf("readinessProbePort must differ from webhookPort (%d)", webhookPort),
+		))
+	}
+
+	return allErrs
 }

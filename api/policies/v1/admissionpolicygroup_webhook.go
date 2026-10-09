@@ -19,11 +19,10 @@ import (
 	"fmt"
 
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/go-logr/logr"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 // SetupWebhookWithManager registers the AdmissionPolicyGroup webhook with the controller manager.
@@ -58,9 +57,6 @@ func (d *admissionPolicyGroupDefaulter) Default(_ context.Context, admissionPoli
 
 	if admissionPolicyGroup.Spec.PolicyServer == "" {
 		admissionPolicyGroup.Spec.PolicyServer = constants.DefaultPolicyServer
-	}
-	if admissionPolicyGroup.ObjectMeta.DeletionTimestamp == nil {
-		controllerutil.AddFinalizer(admissionPolicyGroup, constants.KubewardenFinalizer)
 	}
 
 	return nil

@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/internal/audit-scanner/constants"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/audit-scanner/constants"
 	"github.com/stretchr/testify/assert"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -208,7 +208,7 @@ func TestNewPolicyReportResult(t *testing.T) {
 			errored: false,
 			expectedResult: &wgpolicy.PolicyReportResult{
 				Source:          policyReportSource,
-				Policy:          "clusterwide-policy-name",
+				Policy:          "kw.cap.policy-name",
 				Severity:        severityLow,
 				Result:          statusPass,
 				Timestamp:       now,
@@ -250,7 +250,7 @@ func TestNewPolicyReportResult(t *testing.T) {
 			errored: false,
 			expectedResult: &wgpolicy.PolicyReportResult{
 				Source:          policyReportSource,
-				Policy:          "namespaced-policy-namespace-policy-name",
+				Policy:          "kw.ap.policy-namespace.policy-name",
 				Severity:        severityCritical,
 				Result:          statusFail,
 				Timestamp:       now,
@@ -297,7 +297,7 @@ func TestNewPolicyReportResult(t *testing.T) {
 			errored: true,
 			expectedResult: &wgpolicy.PolicyReportResult{
 				Source:          policyReportSource,
-				Policy:          "namespaced-policy-namespace-policy-name",
+				Policy:          "kw.ap.policy-namespace.policy-name",
 				Severity:        severityInfo,
 				Result:          statusError,
 				Timestamp:       now,

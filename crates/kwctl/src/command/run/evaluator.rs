@@ -9,7 +9,7 @@ use policy_evaluator::{
     kube,
     kubewarden_policy_sdk::settings::SettingsValidationResponse,
     policy_evaluator::{PolicyEvaluator, PolicySettings, ValidateRequest},
-    policy_evaluator_builder::PolicyEvaluatorBuilder,
+    policy_evaluator_builder::{PolicyEvaluatorBuilder, ResourceLimits},
     policy_group_evaluator::evaluator::PolicyGroupEvaluator,
     policy_metadata::{ContextAwareResource, Metadata, PolicyType},
 };
@@ -108,16 +108,18 @@ impl Evaluator {
                 let request =
                     build_validate_request(&cfg.request, *raw || has_raw_policy_type(metadata))?;
 
-                let callback_handler = build_callback_handler(
-                    !context_aware_allowed_resources.is_empty(),
-                    cfg,
-                    shutdown_channel_rx,
-                )
-                .await?;
+                let kube_client_needed = !context_aware_allowed_resources.is_empty();
+
+                let callback_handler =
+                    build_callback_handler(kube_client_needed, cfg, shutdown_channel_rx).await?;
 
                 let mut policy_evaluator_builder = PolicyEvaluatorBuilder::new()
                     .policy_file(local_data.local_path(uri)?)?
-                    .execution_mode(execution_mode);
+                    .execution_mode(execution_mode)
+                    .enable_resource_limits(ResourceLimits {
+                        max_memory_size: cfg.policy_memory_limit_bytes,
+                        max_table_elements: None,
+                    });
                 if cfg.enable_wasmtime_cache {
                     policy_evaluator_builder = policy_evaluator_builder.enable_wasmtime_cache();
                 }
@@ -153,8 +155,28 @@ impl Evaluator {
                     .iter()
                     .any(|(_, pm)| !pm.settings.ctx_aware_resources_allow_list.is_empty());
 
+                // Pre-scan every member's execution mode before building the
+                // callback handler, since `PolicyEvaluatorBuilder` needs it
+                // per member later. Collected eagerly (rather than iterating
+                // `policy_members` a second time later) to avoid relying on
+                // `HashMap` iteration order being stable across two
+                // separate `.iter()` calls.
+                let kube_client_needed = is_context_aware;
+                let mut members_with_execution_mode = Vec::with_capacity(policy_members.len());
+                for (member_id, member) in policy_members {
+                    let metadata = local_data.metadata(&member.uri);
+                    let wasm_path = local_data.local_path(&member.uri)?;
+                    let execution_mode = determine_execution_mode(
+                        metadata,
+                        None,
+                        BackendDetector::default(),
+                        wasm_path,
+                    )?;
+                    members_with_execution_mode.push((member_id, member, execution_mode));
+                }
+
                 let callback_handler =
-                    build_callback_handler(is_context_aware, cfg, shutdown_channel_rx).await?;
+                    build_callback_handler(kube_client_needed, cfg, shutdown_channel_rx).await?;
 
                 // group policies cannot be raw right now
                 let request = build_validate_request(&cfg.request, false)?;
@@ -166,23 +188,14 @@ impl Evaluator {
                     Some(callback_handler.sender_channel()),
                 );
 
-                for (member_id, member) in policy_members {
-                    let metadata = local_data.metadata(&member.uri);
-
-                    let execution_mode = {
-                        let wasm_path = local_data.local_path(&member.uri)?;
-                        determine_execution_mode(
-                            metadata,
-                            None,
-                            BackendDetector::default(),
-                            wasm_path,
-                        )?
-                    };
-
+                for (member_id, member, execution_mode) in members_with_execution_mode {
                     let mut policy_evaluator_builder = PolicyEvaluatorBuilder::new()
                         .policy_file(local_data.local_path(&member.uri)?)?
-                        .execution_mode(execution_mode);
-
+                        .execution_mode(execution_mode)
+                        .enable_resource_limits(ResourceLimits {
+                            max_memory_size: cfg.policy_memory_limit_bytes,
+                            max_table_elements: None,
+                        });
                     if cfg.enable_wasmtime_cache {
                         policy_evaluator_builder = policy_evaluator_builder.enable_wasmtime_cache();
                     }
@@ -337,8 +350,9 @@ async fn build_kube_client() -> Result<kube::Client> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
+
+    use super::*;
 
     fn access_to_pod_and_service() -> BTreeSet<ContextAwareResource> {
         BTreeSet::from([

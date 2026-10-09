@@ -212,6 +212,7 @@ fn subcommand_push() -> Command {
         Arg::new("force")
             .short('f')
             .long("force")
+            .action(ArgAction::SetTrue)
             .help("Push also a policy that is not annotated"),
         Arg::new("output")
             .long("output")
@@ -317,7 +318,7 @@ fn run_args() -> Vec<Arg> {
            .long("execution-mode")
            .short('e')
            .value_name("MODE")
-           .value_parser(PossibleValuesParser::new(["opa","gatekeeper", "kubewarden", "wasi"]))
+           .value_parser(PossibleValuesParser::new(["opa","gatekeeper", "kubewarden", "wasi", "ferricel"]))
            .help("The runtime to use to execute this policy"),
        Arg::new("raw")
                .long("raw")
@@ -328,6 +329,15 @@ fn run_args() -> Vec<Arg> {
            .long("disable-wasmtime-cache")
            .num_args(0)
            .help("Turn off usage of wasmtime cache"),
+       Arg::new("disable-memory-limit")
+           .long("disable-memory-limit")
+           .action(ArgAction::SetTrue)
+           .help("Disable policy memory limit"),
+       Arg::new("policy-memory-limit")
+           .long("policy-memory-limit")
+           .value_name("MAXIMUM_MEMORY_MIB")
+           .default_value("256")
+           .help("Maximum amount of linear memory, in MiB, a policy is allowed to use"),
        Arg::new("allow-context-aware")
            .long("allow-context-aware")
            .num_args(0)
@@ -392,9 +402,19 @@ fn subcommand_annotate() -> Command {
         Arg::new("metadata-path")
             .long("metadata-path")
             .short('m')
-            .required(true)
             .value_name("PATH")
             .help("File containing the metadata"),
+        Arg::new("annotation")
+            .long("annotation")
+            .short('a')
+            .action(ArgAction::Append)
+            .number_of_values(1)
+            .value_name("KEY=VALUE")
+            .help(
+                "Set a single metadata annotation. KEY=@PATH reads the value from a file. \
+                 Can be repeated. Without --metadata-path, the policy must already be \
+                 annotated",
+            ),
         Arg::new("usage-path")
             .long("usage-path")
             .short('u')
@@ -406,6 +426,11 @@ fn subcommand_annotate() -> Command {
             .required(true)
             .value_name("PATH")
             .help("Output file"),
+        Arg::new("force")
+            .short('f')
+            .long("force")
+            .action(ArgAction::SetTrue)
+            .help("Overwrite the metadata of a policy that is already annotated"),
     ];
     args.sort_by(|a, b| a.get_id().cmp(b.get_id()));
     args.push(
@@ -418,6 +443,13 @@ fn subcommand_annotate() -> Command {
     Command::new("annotate")
         .about("Add Kubewarden metadata to a WebAssembly module")
         .args(args)
+        .group(
+            // at least one source of metadata must be given
+            ArgGroup::new("metadata-source")
+                .args(["metadata-path", "annotation", "usage-path"])
+                .multiple(true)
+                .required(true),
+        )
 }
 
 fn subcommand_inspect() -> Command {
@@ -522,7 +554,19 @@ fn subcommand_scaffold() -> Command {
             .long("cel-policy")
             .value_name("URI")
             .default_value("ghcr.io/kubewarden/policies/cel-policy:latest")
+            .conflicts_with("compile-to-wasm")
             .help("The CEL policy module to use"),
+        Arg::new("compile-to-wasm")
+            .long("compile-to-wasm")
+            .value_name("FILE")
+            .conflicts_with("cel-policy")
+            .help("Compile the VAP CEL expressions into a standalone Wasm module and write it to FILE"),
+        Arg::new("force")
+            .long("force")
+            .short('f')
+            .num_args(0)
+            .requires("compile-to-wasm")
+            .help("Overwrite FILE and metadata.yml if they already exist (only valid together with --compile-to-wasm)"),
         Arg::new("policy")
             .long("policy")
             .short('p')
@@ -676,7 +720,7 @@ fn subcommand_save() -> Command {
 
 fn subcommand_docs() -> Command {
     Command::new("docs")
-        .about("Generates the markdown documentation for kwctl commands")
+        .about("Generates documentation for kwctl commands. The output format is determined by the file extension: .md for Markdown, AsciiDoc otherwise")
         .arg(
             Arg::new("output")
                 .long("output")

@@ -5,9 +5,10 @@ use std::{
 };
 
 use axum::Router;
-use policy_evaluator::admission_response_handler::policy_mode::PolicyMode;
-use policy_evaluator::policy_evaluator::PolicySettings;
-use policy_evaluator::policy_metadata::ContextAwareResource;
+use policy_evaluator::{
+    admission_response_handler::policy_mode::PolicyMode, policy_evaluator::PolicySettings,
+    policy_metadata::ContextAwareResource,
+};
 use policy_server::{
     PolicyServer,
     config::{Config, PolicyGroupMember, PolicyOrPolicyGroup},
@@ -20,7 +21,7 @@ static START: Once = Once::new();
 /// Common setup for tests. This function should be called at the beginning of each test.
 pub(crate) fn setup() {
     START.call_once(|| {
-        // Add common setup code here
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
 
@@ -232,6 +233,7 @@ fn default_config() -> Config {
         ignore_kubernetes_connection_failure: true,
         always_accept_admission_reviews_on_namespace: None,
         policy_evaluation_limit_seconds: Some(2),
+        policy_memory_limit_bytes: Some(256 * 1024 * 1024),
         tls_config: None,
         pool_size: 2,
         metrics_enabled: false,

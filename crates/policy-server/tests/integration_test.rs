@@ -518,10 +518,92 @@ async fn test_timeout_protection_policy_specific_reject() {
     );
 }
 
+/// Regression test: `--disable-timeout-protection` (global
+/// `policy_evaluation_limit_seconds = None`) must be an absolute kill
+/// switch. A policy's own `timeoutEvalSeconds` only takes effect as an
+/// override of the global limit; when the global limit is disabled, epoch
+/// interruption is never enabled on the shared engine, so `timeoutEvalSeconds`
+/// must be ignored. This asserts that a policy configured with a 1s timeout,
+/// whose execution takes 4s, is *not* interrupted when the global timeout
+/// protection is disabled.
+#[tokio::test]
+async fn test_timeout_protection_disabled_ignores_policy_specific_timeout() {
+    setup();
+
+    let mut config = default_test_config();
+    config.policy_evaluation_limit_seconds = None; // global timeout protection disabled
+
+    let app = app(config).await;
+
+    let request = Request::builder()
+        .method(http::Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        // This policy has a 1s timeoutEvalSeconds, and its execution time is 4s via the pod
+        // annotation. With timeout protection disabled, this must be ignored.
+        .uri("/validate/sleep-1s-timeout")
+        .body(Body::from(include_str!("data/pod_sleep_4s.json")))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let admission_review_response: AdmissionReviewResponse =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+
+    assert!(
+        admission_review_response.response.allowed,
+        "expected allowed (timeoutEvalSeconds must be ignored when timeout protection is \
+         disabled), got: {:?}",
+        admission_review_response.response
+    );
+}
+
+/// Regression test: with `--disable-timeout-protection` set, Wasmtime epoch
+/// interruption must never be enabled on the shared engine, even when a
+/// sibling policy defines `timeoutEvalSeconds`. Enabling interruption without
+/// giving every policy a deadline makes Wasmtime trap policies with no
+/// deadline of their own immediately (an interruption-enabled Store requires
+/// a deadline before executing any code). This asserts that a policy with no
+/// timeout of its own still evaluates normally in this configuration.
+#[tokio::test]
+async fn test_timeout_protection_disabled_policy_without_timeout_works() {
+    setup();
+
+    let mut config = default_test_config();
+    config.policy_evaluation_limit_seconds = None; // global timeout protection disabled
+    // `sleep-1s-timeout` (also present in this config) has `timeoutEvalSeconds`
+    // set; this must not cause epoch interruption to be enabled.
+
+    let app = app(config).await;
+
+    let request = Request::builder()
+        .method(http::Method::POST)
+        .header(header::CONTENT_TYPE, "application/json")
+        // `sleep` has no timeoutEvalSeconds of its own.
+        .uri("/validate/sleep")
+        .body(Body::from(include_str!("data/pod_sleep_100ms.json")))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let admission_review_response: AdmissionReviewResponse =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+
+    assert!(
+        admission_review_response.response.allowed,
+        "expected allowed, got: {:?}",
+        admission_review_response.response
+    );
+}
+
 #[tokio::test]
 async fn test_context_aware_policy_host_capability_denied() {
-    use policy_evaluator::policy_metadata::ContextAwareResource;
     use std::collections::BTreeSet;
+
+    use policy_evaluator::policy_metadata::ContextAwareResource;
 
     setup();
 
@@ -584,8 +666,9 @@ async fn test_context_aware_policy_host_capability_denied() {
 
 #[tokio::test]
 async fn test_context_aware_policy_host_capability_allowed() {
-    use policy_evaluator::policy_metadata::ContextAwareResource;
     use std::collections::BTreeSet;
+
+    use policy_evaluator::policy_metadata::ContextAwareResource;
 
     setup();
 
@@ -648,8 +731,9 @@ async fn test_context_aware_group_policy_host_capability(
     #[case] host_capabilities: Vec<String>,
     #[case] expect_cap_denied: bool,
 ) {
-    use policy_evaluator::policy_metadata::ContextAwareResource;
     use std::collections::BTreeSet;
+
+    use policy_evaluator::policy_metadata::ContextAwareResource;
 
     setup();
 
@@ -1125,11 +1209,12 @@ async fn test_detect_certificate_rotation() {
 #[tokio::test]
 #[cfg(feature = "otel_tests")]
 async fn test_otel() {
-    use policy_server::{metrics::setup_metrics, tracing::setup_tracing};
     use std::{
         fs::{Permissions, set_permissions},
         os::unix::fs::PermissionsExt,
     };
+
+    use policy_server::{metrics::setup_metrics, tracing::setup_tracing};
     use tempfile::NamedTempFile;
     use testcontainers::{
         GenericImage, ImageExt,
@@ -1640,8 +1725,9 @@ async fn test_policy_server_with_https_proxy(#[case] set_http_proxy: bool) {
 #[serial_test::serial]
 #[tokio::test]
 async fn test_policy_server_with_http_proxy() {
-    use proxy_helpers::*;
     use std::collections::HashSet;
+
+    use proxy_helpers::*;
     use testcontainers::{GenericImage, core::WaitFor, runners::AsyncRunner};
 
     setup();

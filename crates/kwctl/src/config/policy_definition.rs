@@ -454,12 +454,13 @@ impl PolicyDefinition {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use k8s_openapi::apimachinery::pkg::runtime::RawExtension;
-    use policy_evaluator::kubewarden_policy_sdk::crd::policies::common::ContextAwareResource as ContextAwareResourceSdk;
-    use policy_evaluator::kubewarden_policy_sdk::crd::policies::common::PolicyMode as PolicyModeSdk;
+    use policy_evaluator::kubewarden_policy_sdk::crd::policies::common::{
+        ContextAwareResource as ContextAwareResourceSdk, PolicyMode as PolicyModeSdk,
+    };
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn policy_definition_from_admission_policy() {
@@ -520,6 +521,7 @@ mod tests {
                 assert_eq!(custom_rejection_message, Some("foo".to_string()));
                 assert_eq!(settings, expected_settings);
                 assert!(matches!(ctx_aware_cfg, ContextAwareConfiguration::NoAccess));
+                assert!(allowed_host_capabilities.is_empty());
             }
             _ => panic!("Expected Individual PolicyDefinition"),
         }
@@ -610,6 +612,7 @@ mod tests {
                     ctx_aware_cfg,
                     ContextAwareConfiguration::AllowList(expected_context_aware_resources)
                 );
+                assert!(allowed_host_capabilities.is_empty());
             }
             _ => panic!("Expected Individual PolicyDefinition"),
         }

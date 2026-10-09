@@ -1,3 +1,5 @@
+use std::{convert::TryFrom, str::FromStr, sync::Arc};
+
 use oci_client::{Reference, manifest::WASM_LAYER_MEDIA_TYPE, secrets::RegistryAuth};
 use sigstore::{
     cosign::{self, ClientBuilder, CosignCapabilities, signature_layers::SignatureLayer},
@@ -5,7 +7,6 @@ use sigstore::{
     registry::oci_reference::OciReference,
     trust::sigstore::SigstoreTrustRoot,
 };
-use std::{convert::TryFrom, str::FromStr, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -54,9 +55,8 @@ impl Verifier {
     ) -> VerifyResult<Self> {
         let client_config: sigstore::registry::ClientConfig =
             sources.clone().unwrap_or_default().into();
-        let mut cosign_client_builder = ClientBuilder::default()
-            .with_oci_client_config(client_config)
-            .enable_registry_caching();
+        let mut cosign_client_builder =
+            ClientBuilder::default().with_oci_client_config(client_config);
         let cosign_client = match trust_root {
             Some(trust_root) => {
                 cosign_client_builder =
@@ -94,7 +94,7 @@ impl Verifier {
     /// Note well: right now, verification can be done only against policies
     /// that are stored inside of OCI registries.
     pub async fn verify(
-        &mut self,
+        &self,
         image_url: &str,
         verification_config: &config::LatestVerificationConfig,
     ) -> VerifyResult<String> {
@@ -120,7 +120,7 @@ impl Verifier {
     /// Note well: right now, verification can be done only against policies
     /// that are stored inside of OCI registries.
     pub async fn verify_local_file_checksum(
-        &mut self,
+        &self,
         policy: &Policy,
         verified_manifest_digest: &str,
     ) -> VerifyResult<()> {
@@ -306,18 +306,14 @@ pub async fn fetch_sigstore_remote_data(
     let image_name = reference.whole();
     let image_oci_ref = OciReference::from_str(&image_name)
         .map_err(VerifyError::FailedToFetchTrustedLayersError)?;
-    let (cosign_signature_image, source_image_digest) = cosign_client
+    let (_, source_image_digest) = cosign_client
         .triangulate(&image_oci_ref, &sigstore_auth)
         .await
         .map_err(VerifyError::FailedToFetchTrustedLayersError)?;
 
     // get trusted layers
     let layers = cosign_client
-        .trusted_signature_layers(
-            &sigstore_auth,
-            &source_image_digest,
-            &cosign_signature_image,
-        )
+        .trusted_signature_layers(&sigstore_auth, &image_oci_ref)
         .await
         .map_err(|e| match e {
             SigstoreError::RegistryPullManifestError { image: _, error: _ } => {
@@ -332,13 +328,13 @@ pub async fn fetch_sigstore_remote_data(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use config::{AnyOf, LatestVerificationConfig, Signature, Subject};
     use cosign::signature_layers::CertificateSubject;
-    use sigstore::{
-        cosign::payload::simple_signing::SimpleSigning,
-        cosign::signature_layers::CertificateSignature,
+    use sigstore::cosign::{
+        payload::simple_signing::SimpleSigning, signature_layers::CertificateSignature,
     };
+
+    use super::*;
 
     fn build_signature_layers_keyless(
         issuer: Option<String>,

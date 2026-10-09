@@ -12,7 +12,7 @@
 #               and exercise the webhook to confirm allow/deny behaviour.
 #
 # Based on: https://github.com/sigstore/scaffolding/blob/main/getting-started.md
-# Related:  https://github.com/kubewarden/kubewarden-controller/pull/1485
+# Related:  https://github.com/kubewarden/adm-controller/pull/1485
 #
 # Usage:
 #   ./test-sigstore-e2e.sh [OPTIONS]
@@ -28,8 +28,8 @@
 #   --no-sigstore         Install Kubewarden in stage 3 without any Sigstore
 #                         configuration. Skips policy deployment and webhook evaluation.
 #   --policy-server-image Full image reference (repository:tag) for the policy-server.
-#                         Overrides the default image in charts/kubewarden-defaults.
-#                         Example: --policy-server-image ghcr.io/kubewarden/policy-server:dev
+#                         Overrides the default image in the kubewarden-controller chart.
+#                         Example: --policy-server-image ghcr.io/kubewarden/adm-controller/policy-server:dev
 #
 # Tools required (per stage):
 #   All stages:  kubectl, jq
@@ -45,9 +45,12 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 # ── Versions ──────────────────────────────────────────────────────────────────
-SCAFFOLDING_VERSION=v0.7.31
-SETUP_KIND_SHA256=a739e49ee8f98c8e966a1e6fddf38598acf09cf27ada2a0ebb3901fd366cecad
-SETUP_SCAFFOLDING_SHA256=8861da880cb8f4ddc22fb83e92975dd6744bd6cea8f1d4025183d740ddbb2222
+# renovate: datasource=github-release-attachments depName=sigstore/scaffolding
+SCAFFOLDING_VERSION=v0.7.37
+# renovate: datasource=github-release-attachments depName=sigstore/scaffolding digestVersion=v0.7.37
+SETUP_KIND_SHA256=aaaec61847800edcdc6abe40240443b52f3ccf7435759e07afca6509e85bb9e3
+# renovate: datasource=github-release-attachments depName=sigstore/scaffolding digestVersion=v0.7.37
+SETUP_SCAFFOLDING_SHA256=70e3341d544efcd9b3c243682d3ef16bfc12fef4cc9bb43c6c99755e09270736
 
 # ── Image references ──────────────────────────────────────────────────────────
 SOURCE_POLICY_IMAGE=ghcr.io/kubewarden/tests/pod-privileged:v0.2.5
@@ -398,19 +401,14 @@ function install_kubewarden() {
     kubectl create namespace "$KUBEWARDEN_NAMESPACE" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-    echo -e "${GREEN}  Installing kubewarden-crds...${NC}"
-    helm upgrade --install kubewarden-crds ./charts/kubewarden-crds \
-        -n "$KUBEWARDEN_NAMESPACE" \
-        --wait
-
-    echo -e "${GREEN}  Installing kubewarden-controller...${NC}"
-    helm upgrade --install kubewarden-controller ./charts/kubewarden-controller \
+    echo -e "${GREEN}  Installing kubewarden-controller (unified chart)...${NC}"
+    helm upgrade --install kubewarden-controller ./charts/admission-controller \
         -n "$KUBEWARDEN_NAMESPACE" \
         --set replicas=1 \
         --wait
 
-    echo -e "${GREEN}  Waiting for kubewarden-controller rollout...${NC}"
-    kubectl rollout status deployment/kubewarden-controller \
+    echo -e "${GREEN}  Waiting for admission-controller rollout...${NC}"
+    kubectl rollout status deployment/kubewarden-controller-admission-controller \
         -n "$KUBEWARDEN_NAMESPACE" --timeout=3m
 }
 
@@ -439,15 +437,16 @@ function configure_policy_server() {
         -n "$KUBEWARDEN_NAMESPACE" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-    echo -e "${GREEN}  Installing kubewarden-defaults with sigstoreTrustConfig...${NC}"
+    echo -e "${GREEN}  Upgrading kubewarden-controller with default PolicyServer and Sigstore config...${NC}"
     local image_flags=()
     build_image_flags
     image_flags=("${IMAGE_FLAGS[@]}")
 
-    helm upgrade --install kubewarden-defaults ./charts/kubewarden-defaults \
+    helm upgrade --install kubewarden-controller ./charts/admission-controller \
         -n "$KUBEWARDEN_NAMESPACE" \
-        --set policyServer.sigstoreTrustConfig="$SIGSTORE_TRUST_CONFIGMAP" \
-        --set policyServer.verificationConfig="$VERIFICATION_CONFIGMAP" \
+        --set replicas=1 \
+        --set 'policyServer.sigstoreTrustConfig'="$SIGSTORE_TRUST_CONFIGMAP" \
+        --set 'policyServer.verificationConfig'="$VERIFICATION_CONFIGMAP" \
         --set 'policyServer.insecureSources[0]=registry.local:5001' \
         --set 'policyServer.env[0].name=KUBEWARDEN_LOG_LEVEL' \
         --set 'policyServer.env[0].value=info' \
@@ -460,14 +459,15 @@ function configure_policy_server() {
 }
 
 function install_kubewarden_no_sigstore() {
-    echo -e "${GREEN}Installing kubewarden-defaults (no Sigstore configuration)...${NC}"
+    echo -e "${GREEN}Upgrading kubewarden-controller with default PolicyServer (no Sigstore configuration)...${NC}"
 
     local image_flags=()
     build_image_flags
     image_flags=("${IMAGE_FLAGS[@]}")
 
-    helm upgrade --install kubewarden-defaults ./charts/kubewarden-defaults \
+    helm upgrade --install kubewarden-controller ./charts/admission-controller \
         -n "$KUBEWARDEN_NAMESPACE" \
+        --set replicas=1 \
         --set 'policyServer.env[0].name=KUBEWARDEN_LOG_LEVEL' \
         --set 'policyServer.env[0].value=info' \
         --set 'policyServer.env[1].name=RUST_BACKTRACE' \

@@ -35,12 +35,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 const (
-	integrationTestsFinalizer = "kubewarden.io/integration-tests-safety-net-finalizer"
 	clientCAConfigMapName     = "client-ca"
 	fakeSigstoreTrustConfig   = `{"trusted_root": {"version": "test"}}`
 	reconcilerImagePullSecret = "reconciler-pull-secret"
@@ -208,8 +207,8 @@ func policyGroupHostCapabilitiesMatcher(
 	namespacedHostCapsMatcher types.GomegaMatcher,
 	clusterHostCapsMatcher types.GomegaMatcher,
 ) types.GomegaMatcher {
-	return WithTransform(func(data string) (map[string]interface{}, error) {
-		policiesData := map[string]interface{}{}
+	return WithTransform(func(data string) (map[string]any, error) {
+		policiesData := map[string]any{}
 		err := json.Unmarshal([]byte(data), &policiesData)
 		return policiesData, err
 	}, MatchKeys(IgnoreExtras, Keys{
@@ -241,8 +240,8 @@ func admissionPolicyHostCapabilitiesMatcher(
 	namespacedHostCapsMatcher types.GomegaMatcher,
 	clusterHostCapsMatcher types.GomegaMatcher,
 ) types.GomegaMatcher {
-	return WithTransform(func(data string) (map[string]interface{}, error) {
-		policiesData := map[string]interface{}{}
+	return WithTransform(func(data string) (map[string]any, error) {
+		policiesData := map[string]any{}
 		err := json.Unmarshal([]byte(data), &policiesData)
 		return policiesData, err
 	}, MatchKeys(IgnoreExtras, Keys{

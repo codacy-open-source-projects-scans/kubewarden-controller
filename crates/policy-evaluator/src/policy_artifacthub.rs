@@ -1,27 +1,28 @@
+use std::{collections::BTreeMap, convert::TryInto, str::FromStr};
+
 use email_address::*;
 use policy_fetcher::oci_client::{ParseError, Reference};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::convert::TryInto;
-use std::str::FromStr;
 use time::OffsetDateTime;
 use url::Url;
 
-use crate::constants::{
-    ARTIFACTHUB_ANNOTATION_KUBEWARDEN_CONTEXTAWARE_RESOURCES,
-    ARTIFACTHUB_ANNOTATION_KUBEWARDEN_MUTATION, ARTIFACTHUB_ANNOTATION_KUBEWARDEN_QUESTIONSUI,
-    ARTIFACTHUB_ANNOTATION_KUBEWARDEN_RESOURCES, ARTIFACTHUB_ANNOTATION_KUBEWARDEN_RULES,
-    ARTIFACTHUB_ANNOTATION_RANCHER_HIDDENUI, KUBEWARDEN_ANNOTATION_ARTIFACTHUB_DISPLAYNAME,
-    KUBEWARDEN_ANNOTATION_ARTIFACTHUB_HIDDENUI, KUBEWARDEN_ANNOTATION_ARTIFACTHUB_KEYWORDS,
-    KUBEWARDEN_ANNOTATION_ARTIFACTHUB_RESOURCES, KUBEWARDEN_ANNOTATION_GITHUB_RELEASE_TAG,
-    KUBEWARDEN_ANNOTATION_POLICY_AUTHOR, KUBEWARDEN_ANNOTATION_POLICY_DESCRIPTION,
-    KUBEWARDEN_ANNOTATION_POLICY_LICENSE, KUBEWARDEN_ANNOTATION_POLICY_OCIURL,
-    KUBEWARDEN_ANNOTATION_POLICY_SOURCE, KUBEWARDEN_ANNOTATION_POLICY_TITLE,
-    KUBEWARDEN_ANNOTATION_POLICY_URL, KUBEWARDEN_ANNOTATION_POLICY_VERSION,
+use crate::{
+    constants::{
+        ARTIFACTHUB_ANNOTATION_KUBEWARDEN_CONTEXTAWARE_RESOURCES,
+        ARTIFACTHUB_ANNOTATION_KUBEWARDEN_MUTATION, ARTIFACTHUB_ANNOTATION_KUBEWARDEN_QUESTIONSUI,
+        ARTIFACTHUB_ANNOTATION_KUBEWARDEN_RESOURCES, ARTIFACTHUB_ANNOTATION_KUBEWARDEN_RULES,
+        ARTIFACTHUB_ANNOTATION_RANCHER_HIDDENUI, KUBEWARDEN_ANNOTATION_ARTIFACTHUB_DISPLAYNAME,
+        KUBEWARDEN_ANNOTATION_ARTIFACTHUB_HIDDENUI, KUBEWARDEN_ANNOTATION_ARTIFACTHUB_KEYWORDS,
+        KUBEWARDEN_ANNOTATION_ARTIFACTHUB_RESOURCES, KUBEWARDEN_ANNOTATION_GITHUB_RELEASE_TAG,
+        KUBEWARDEN_ANNOTATION_POLICY_AUTHOR, KUBEWARDEN_ANNOTATION_POLICY_DESCRIPTION,
+        KUBEWARDEN_ANNOTATION_POLICY_LICENSE, KUBEWARDEN_ANNOTATION_POLICY_OCIURL,
+        KUBEWARDEN_ANNOTATION_POLICY_SOURCE, KUBEWARDEN_ANNOTATION_POLICY_TITLE,
+        KUBEWARDEN_ANNOTATION_POLICY_URL, KUBEWARDEN_ANNOTATION_POLICY_VERSION,
+    },
+    errors::ArtifactHubError,
+    policy_metadata::Metadata,
 };
-use crate::errors::ArtifactHubError;
-use crate::policy_metadata::Metadata;
 
 pub type Result<T> = std::result::Result<T, ArtifactHubError>;
 
@@ -177,10 +178,7 @@ impl ArtifactHubPkg {
 
         let semver_version = Version::parse(version)
             .map_err(|e| ArtifactHubError::NoSemverVersion(e.to_string()))?;
-        if questions
-            .and_then(|q| if q.is_empty() { Some(q) } else { None })
-            .is_some()
-        {
+        if questions.filter(|&q| q.is_empty()).is_some() {
             return Err(ArtifactHubError::EmptyQuestionsUI);
         }
 
@@ -387,7 +385,7 @@ fn parse_links(
 
 fn compose_install(oci_url: String) -> String {
     format!(
-        r#"The policy can be obtained using [`kwctl`](https://github.com/kubewarden/kwctl):
+        r#"The policy can be obtained using [kwctl](https://docs.kubewarden.io/howtos/install-kwctl):
 ```console
 kwctl pull {oci_url}
 ```
@@ -491,11 +489,13 @@ fn parse_annotations(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::policy_metadata::{ContextAwareResource, PolicyType};
+    use std::collections::{BTreeMap, BTreeSet};
+
     use assert_json_diff::assert_json_eq;
     use serde_json::json;
-    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+    use crate::policy_metadata::{ContextAwareResource, PolicyType};
 
     fn mock_metadata_with_minimum_required() -> Metadata {
         Metadata {
@@ -866,7 +866,7 @@ mod tests {
                 "kubewarden/rules": "[]\n",
                 "kubewarden/resources": "Pod, Deployment",
             },
-            "install": r#"The policy can be obtained using [`kwctl`](https://github.com/kubewarden/kwctl):
+            "install": r#"The policy can be obtained using [kwctl](https://docs.kubewarden.io/howtos/install-kwctl):
 ```console
 kwctl pull ghcr.io/ocirepo/namespace/verify-image-signatures:v0.2.1
 ```
@@ -932,7 +932,7 @@ kwctl scaffold manifest -t ClusterAdmissionPolicy registry://ghcr.io/ocirepo/nam
                 "url": "https://github.com/repo"
             }
             ],
-            "install": r#"The policy can be obtained using [`kwctl`](https://github.com/kubewarden/kwctl):
+            "install": r#"The policy can be obtained using [kwctl](https://docs.kubewarden.io/howtos/install-kwctl):
 ```console
 kwctl pull ghcr.io/ocirepo/namespace/verify-image-signatures:v0.2.1
 ```

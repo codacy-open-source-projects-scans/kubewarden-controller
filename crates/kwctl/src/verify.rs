@@ -1,3 +1,5 @@
+use std::{collections::BTreeMap, sync::Arc};
+
 use anyhow::Result;
 use policy_evaluator::policy_fetcher::{
     policy::Policy,
@@ -5,8 +7,6 @@ use policy_evaluator::policy_fetcher::{
     sources::Sources,
     verify::{Verifier, config::LatestVerificationConfig},
 };
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use tracing::{debug, info};
 
 pub(crate) type VerificationAnnotations = BTreeMap<String, String>;
@@ -23,7 +23,7 @@ pub(crate) async fn verify(
         ?verification_config,
         "Verifying policy"
     );
-    let mut verifier = Verifier::new(sources.cloned(), sigstore_trust_root).await?;
+    let verifier = Verifier::new(sources.cloned(), sigstore_trust_root).await?;
     let verified_manifest_digest = verifier.verify(url, verification_config).await?;
 
     info!("Policy successfully verified");
@@ -36,7 +36,7 @@ pub(crate) async fn verify_local_checksum(
     verified_manifest_digest: &str,
     sigstore_trust_root: Option<Arc<SigstoreTrustRoot>>,
 ) -> Result<()> {
-    let mut verifier = Verifier::new(sources.cloned(), sigstore_trust_root).await?;
+    let verifier = Verifier::new(sources.cloned(), sigstore_trust_root).await?;
     verifier
         .verify_local_file_checksum(policy, verified_manifest_digest)
         .await?;

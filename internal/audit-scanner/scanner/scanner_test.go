@@ -11,12 +11,12 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	auditConstants "github.com/kubewarden/kubewarden-controller/internal/audit-scanner/constants"
-	"github.com/kubewarden/kubewarden-controller/internal/audit-scanner/k8s"
-	"github.com/kubewarden/kubewarden-controller/internal/audit-scanner/policies"
-	"github.com/kubewarden/kubewarden-controller/internal/audit-scanner/report"
-	auditscheme "github.com/kubewarden/kubewarden-controller/internal/audit-scanner/scheme"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	auditConstants "github.com/kubewarden/adm-controller/internal/audit-scanner/constants"
+	"github.com/kubewarden/adm-controller/internal/audit-scanner/k8s"
+	"github.com/kubewarden/adm-controller/internal/audit-scanner/policies"
+	"github.com/kubewarden/adm-controller/internal/audit-scanner/report"
+	auditscheme "github.com/kubewarden/adm-controller/internal/audit-scanner/scheme"
 	openreports "github.com/openreports/reports-api/apis/openreports.io/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,7 +34,7 @@ import (
 	testingclient "k8s.io/client-go/testing"
 	wgpolicy "sigs.k8s.io/wg-policy-prototypes/policy-report/pkg/api/wgpolicyk8s.io/v1alpha2"
 
-	"github.com/kubewarden/kubewarden-controller/internal/audit-scanner/testutils"
+	"github.com/kubewarden/adm-controller/internal/audit-scanner/testutils"
 )
 
 const (
@@ -1786,4 +1786,226 @@ func TestScanClusterWideResourcesWithOpenReport(t *testing.T) {
 	assert.Equal(t, 3, clusterPolicyReport.Summary.Pass)
 	assert.Len(t, clusterPolicyReport.Results, 3)
 	assert.Equal(t, runUID, clusterPolicyReport.GetLabels()[auditConstants.AuditScannerRunUIDLabel])
+}
+
+// TestScanNamespaceWithNoAuditablePoliciesDeletesAllManagedReports covers the
+// bulk-delete fast path: when no policy targets any resource in a namespace,
+// no report can have been written during the scan, so every kubewarden-managed
+// report found for that namespace must be deleted regardless of its
+// run-uid label.
+func TestScanNamespaceWithNoAuditablePoliciesDeletesAllManagedReports(t *testing.T) {
+	namespace1 := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "namespace1",
+			UID:  "namespace1-uid",
+		},
+	}
+
+	// A managed report left over from a previous scan, when a policy still
+	// targeted this namespace.
+	staleReport := testutils.NewPolicyReportFactory().
+		Name("stale-report").Namespace("namespace1").WithAppLabel().Build()
+
+	dynamicClient := dynamicFake.NewSimpleDynamicClient(scheme.Scheme, namespace1)
+	clientset := fake.NewClientset(namespace1)
+	client, err := testutils.NewFakeClient(namespace1, staleReport)
+	require.NoError(t, err)
+
+	logger := slog.Default()
+	k8sClient := k8s.NewClient(dynamicClient, clientset, "kubewarden", nil, pageSize, logger)
+	policiesClient := policies.NewClient(client, "kubewarden", "", logger)
+	policyReportStore := report.NewPolicyReportStore(client, logger)
+
+	config := newTestConfig(policiesClient, k8sClient, policyReportStore)
+	scanner, err := NewScanner(config)
+	require.NoError(t, err)
+
+	runUID := uuid.New().String()
+	err = scanner.ScanNamespace(t.Context(), "namespace1", runUID)
+	require.NoError(t, err)
+
+	err = client.Get(t.Context(), types.NamespacedName{Name: "stale-report", Namespace: "namespace1"}, &wgpolicy.PolicyReport{})
+	require.True(t, apimachineryErrors.IsNotFound(err))
+}
+
+// TestScanClusterWideResourcesWithNoAuditablePoliciesDeletesAllManagedReports
+// is the cluster-scoped counterpart of
+// TestScanNamespaceWithNoAuditablePoliciesDeletesAllManagedReports.
+func TestScanClusterWideResourcesWithNoAuditablePoliciesDeletesAllManagedReports(t *testing.T) {
+	staleClusterReport := testutils.NewClusterPolicyReportFactory().
+		Name("stale-cluster-report").WithAppLabel().Build()
+
+	dynamicClient := dynamicFake.NewSimpleDynamicClient(scheme.Scheme)
+	clientset := fake.NewClientset()
+	client, err := testutils.NewFakeClient(staleClusterReport)
+	require.NoError(t, err)
+
+	logger := slog.Default()
+	k8sClient := k8s.NewClient(dynamicClient, clientset, "kubewarden", nil, pageSize, logger)
+	policiesClient := policies.NewClient(client, "kubewarden", "", logger)
+	policyReportStore := report.NewPolicyReportStore(client, logger)
+
+	config := newTestConfig(policiesClient, k8sClient, policyReportStore)
+	scanner, err := NewScanner(config)
+	require.NoError(t, err)
+
+	runUID := uuid.New().String()
+	err = scanner.ScanClusterWideResources(t.Context(), runUID)
+	require.NoError(t, err)
+
+	err = client.Get(t.Context(), types.NamespacedName{Name: "stale-cluster-report"}, &wgpolicy.ClusterPolicyReport{})
+	require.True(t, apimachineryErrors.IsNotFound(err))
+}
+
+// TestScanNamespaceWithDisableStoreSkipsFastPathDeletion covers --disable-store
+// in the bulk-delete fast path (no auditable policies target the namespace):
+// a pre-existing managed report must survive the scan, since --disable-store
+// must not result in the deletion of any resource in the cluster.
+func TestScanNamespaceWithDisableStoreSkipsFastPathDeletion(t *testing.T) {
+	namespace1 := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "namespace1",
+			UID:  "namespace1-uid",
+		},
+	}
+
+	staleReport := testutils.NewPolicyReportFactory().
+		Name("stale-report").Namespace("namespace1").WithAppLabel().Build()
+
+	dynamicClient := dynamicFake.NewSimpleDynamicClient(scheme.Scheme, namespace1)
+	clientset := fake.NewClientset(namespace1)
+	client, err := testutils.NewFakeClient(namespace1, staleReport)
+	require.NoError(t, err)
+
+	logger := slog.Default()
+	k8sClient := k8s.NewClient(dynamicClient, clientset, "kubewarden", nil, pageSize, logger)
+	policiesClient := policies.NewClient(client, "kubewarden", "", logger)
+	policyReportStore := report.NewPolicyReportStore(client, logger)
+
+	config := newTestConfig(policiesClient, k8sClient, policyReportStore)
+	config.DisableStore = true
+	scanner, err := NewScanner(config)
+	require.NoError(t, err)
+
+	runUID := uuid.New().String()
+	err = scanner.ScanNamespace(t.Context(), "namespace1", runUID)
+	require.NoError(t, err)
+
+	err = client.Get(t.Context(), types.NamespacedName{Name: "stale-report", Namespace: "namespace1"}, &wgpolicy.PolicyReport{})
+	require.NoError(t, err, "--disable-store must not delete existing reports")
+}
+
+// TestScanClusterWideResourcesWithDisableStoreSkipsFastPathDeletion is the
+// cluster-scoped counterpart of
+// TestScanNamespaceWithDisableStoreSkipsFastPathDeletion.
+func TestScanClusterWideResourcesWithDisableStoreSkipsFastPathDeletion(t *testing.T) {
+	staleClusterReport := testutils.NewClusterPolicyReportFactory().
+		Name("stale-cluster-report").WithAppLabel().Build()
+
+	dynamicClient := dynamicFake.NewSimpleDynamicClient(scheme.Scheme)
+	clientset := fake.NewClientset()
+	client, err := testutils.NewFakeClient(staleClusterReport)
+	require.NoError(t, err)
+
+	logger := slog.Default()
+	k8sClient := k8s.NewClient(dynamicClient, clientset, "kubewarden", nil, pageSize, logger)
+	policiesClient := policies.NewClient(client, "kubewarden", "", logger)
+	policyReportStore := report.NewPolicyReportStore(client, logger)
+
+	config := newTestConfig(policiesClient, k8sClient, policyReportStore)
+	config.DisableStore = true
+	scanner, err := NewScanner(config)
+	require.NoError(t, err)
+
+	runUID := uuid.New().String()
+	err = scanner.ScanClusterWideResources(t.Context(), runUID)
+	require.NoError(t, err)
+
+	err = client.Get(t.Context(), types.NamespacedName{Name: "stale-cluster-report"}, &wgpolicy.ClusterPolicyReport{})
+	require.NoError(t, err, "--disable-store must not delete existing reports")
+}
+
+// TestScanNamespaceWithDisableStoreSkipsDeletionAndCreation covers
+// --disable-store on the per-item write-set path (at least one policy is
+// auditable in the namespace): a pre-existing stale managed report must
+// survive the scan, and no report must be created for the audited resource,
+// since --disable-store must not result in the deletion or creation of any
+// resource in the cluster.
+func TestScanNamespaceWithDisableStoreSkipsDeletionAndCreation(t *testing.T) {
+	mockPolicyServer := newMockPolicyServer()
+	defer mockPolicyServer.Close()
+
+	policyServer := &policiesv1.PolicyServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "default"},
+	}
+	policyServerService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:    map[string]string{"app.kubernetes.io/instance": "policy-server-default"},
+			Name:      "policy-server-default",
+			Namespace: "kubewarden",
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Name: "http", Port: 443}},
+		},
+	}
+
+	namespace1 := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "namespace1"},
+	}
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "namespace1", UID: "pod1-uid"},
+	}
+
+	admissionPolicy1 := testutils.
+		NewAdmissionPolicyFactory().
+		Name("admissionPolicy1").
+		Namespace("namespace1").
+		Rule(admissionregistrationv1.Rule{
+			APIGroups:   []string{""},
+			APIVersions: []string{"v1"},
+			Resources:   []string{"pods"},
+		}).
+		Status(policiesv1.PolicyStatusActive).
+		Build()
+
+	// A managed report left over from a previous scan, unrelated to pod1, so
+	// it would be considered stale by the write-set based GC.
+	staleReport := testutils.NewPolicyReportFactory().
+		Name("stale-report").Namespace("namespace1").WithAppLabel().Build()
+
+	auditScheme, err := auditscheme.NewScheme()
+	require.NoError(t, err)
+	dynamicClient := dynamicFake.NewSimpleDynamicClient(auditScheme, pod1, namespace1)
+	clientset := fake.NewClientset(namespace1)
+	client, err := testutils.NewFakeClient(
+		namespace1,
+		policyServer,
+		policyServerService,
+		admissionPolicy1,
+		staleReport,
+	)
+	require.NoError(t, err)
+
+	logger := slog.Default()
+	k8sClient := k8s.NewClient(dynamicClient, clientset, "kubewarden", nil, pageSize, logger)
+	policiesClient := policies.NewClient(client, "kubewarden", mockPolicyServer.URL, logger)
+	policyReportStore := report.NewPolicyReportStore(client, logger)
+
+	config := newTestConfig(policiesClient, k8sClient, policyReportStore)
+	config.DisableStore = true
+	scanner, err := NewScanner(config)
+	require.NoError(t, err)
+
+	runUID := uuid.New().String()
+	err = scanner.ScanNamespace(t.Context(), "namespace1", runUID)
+	require.NoError(t, err)
+
+	// the stale report must survive: --disable-store must not delete it
+	err = client.Get(t.Context(), types.NamespacedName{Name: "stale-report", Namespace: "namespace1"}, &wgpolicy.PolicyReport{})
+	require.NoError(t, err, "--disable-store must not delete existing reports")
+
+	// no report must have been created for pod1: --disable-store must not
+	// create new reports either
+	err = client.Get(t.Context(), types.NamespacedName{Name: string(pod1.GetUID()), Namespace: "namespace1"}, &wgpolicy.PolicyReport{})
+	require.True(t, apimachineryErrors.IsNotFound(err), "--disable-store must not create new reports")
 }

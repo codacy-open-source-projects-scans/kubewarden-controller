@@ -4,12 +4,11 @@ pub mod policy_evaluator_builder;
 mod policy_evaluator_pre;
 mod stack_pre;
 
-pub use evaluator::PolicyEvaluator;
-pub use policy_evaluator_pre::PolicyEvaluatorPre;
-
 use std::{convert::TryFrom, fmt, result::Result};
 
+pub use evaluator::PolicyEvaluator;
 use k8s_openapi::apimachinery::pkg::runtime::RawExtension;
+pub use policy_evaluator_pre::PolicyEvaluatorPre;
 use serde::{Deserialize, Serialize};
 use serde_json::value;
 
@@ -26,6 +25,8 @@ pub enum PolicyExecutionMode {
     OpaGatekeeper,
     #[serde(rename = "wasi")]
     Wasi,
+    #[serde(rename = "ferricel")]
+    Ferricel,
 }
 
 impl fmt::Display for PolicyExecutionMode {
@@ -73,7 +74,9 @@ impl TryFrom<PolicyExecutionMode> for RegoPolicyExecutionMode {
         match execution_mode {
             PolicyExecutionMode::Opa => Ok(RegoPolicyExecutionMode::Opa),
             PolicyExecutionMode::OpaGatekeeper => Ok(RegoPolicyExecutionMode::Gatekeeper),
-            PolicyExecutionMode::KubewardenWapc | PolicyExecutionMode::Wasi => {
+            PolicyExecutionMode::KubewardenWapc
+            | PolicyExecutionMode::Wasi
+            | PolicyExecutionMode::Ferricel => {
                 Err(PolicyEvaluatorBuilderError::ExecutionModeNotRegoCompatible)
             }
         }
@@ -106,12 +109,12 @@ impl TryFrom<&serde_json::Value> for PolicySettings {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::collections::HashMap;
 
     use rstest::rstest;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn serialize_policy_execution_mode() {
@@ -127,6 +130,10 @@ mod tests {
         test_data.insert(
             serde_json::to_string(&json!("gatekeeper")).unwrap(),
             PolicyExecutionMode::OpaGatekeeper,
+        );
+        test_data.insert(
+            serde_json::to_string(&json!("ferricel")).unwrap(),
+            PolicyExecutionMode::Ferricel,
         );
 
         for (expected, mode) in &test_data {
@@ -150,6 +157,10 @@ mod tests {
         test_data.insert(
             serde_json::to_string(&json!("gatekeeper")).unwrap(),
             PolicyExecutionMode::OpaGatekeeper,
+        );
+        test_data.insert(
+            serde_json::to_string(&json!("ferricel")).unwrap(),
+            PolicyExecutionMode::Ferricel,
         );
 
         for (mode_str, expected) in &test_data {

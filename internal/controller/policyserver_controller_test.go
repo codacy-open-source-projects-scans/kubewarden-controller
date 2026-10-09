@@ -22,11 +22,14 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 
+	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gstruct"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8spoliciesv1 "k8s.io/api/policy/v1"
@@ -36,8 +39,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 var _ = Describe("PolicyServer controller", func() {
@@ -176,6 +179,8 @@ var _ = Describe("PolicyServer controller", func() {
 			By("checking the deployment spec")
 			Expect(deployment.Spec.Template.Spec).To(MatchFields(IgnoreExtras, Fields{
 				"Tolerations": BeEmpty(),
+				"HostNetwork": BeFalse(),
+				"DNSPolicy":   Not(Equal(corev1.DNSClusterFirstWithHostNet)),
 				"SecurityContext": PointTo(MatchFields(IgnoreExtras, Fields{
 					"SELinuxOptions":      BeNil(),
 					"WindowsOptions":      BeNil(),
@@ -263,6 +268,33 @@ var _ = Describe("PolicyServer controller", func() {
 					constants.PolicyServerConfigSourcesEntry:  Equal("{}"),
 				}),
 			})))
+		})
+
+		It("should create the policy server configmap with the same labels as the other policy server resources", func() {
+			policyServer := policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()
+			createPolicyServerAndWaitForItsService(ctx, policyServer)
+
+			configmap, err := getTestPolicyServerConfigMap(ctx, policyServerName)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(configmap.Labels).To(HaveKeyWithValue(constants.PolicyServerLabelKey, policyServerName))
+			for k, v := range policyServer.CommonLabels() {
+				Expect(configmap.Labels).To(HaveKeyWithValue(k, v))
+			}
+		})
+
+		It("should add the Kubewarden finalizer during reconciliation when it is missing", func() {
+			// PolicyServers kept across a Helm uninstall/reinstall cycle have
+			// their finalizers stripped by the uninstall cleanup, and the reconciler
+			// must add them back.
+			policyServer := policiesv1.NewPolicyServerFactory().WithName(policyServerName).WithoutFinalizers().Build()
+			createPolicyServerAndWaitForItsService(ctx, policyServer)
+
+			Eventually(func() (*policiesv1.PolicyServer, error) {
+				return getTestPolicyServer(ctx, policyServerName)
+			}, timeout, pollInterval).Should(
+				HaveField("Finalizers", ContainElement(constants.KubewardenFinalizer)),
+			)
 		})
 
 		It("should create the policy server configmap with the assigned policies", func() {
@@ -386,6 +418,15 @@ var _ = Describe("PolicyServer controller", func() {
 				Message:               clusterPolicyGroup.GetMessage(),
 				TimeoutEvalSeconds:    &timeoutEvalSeconds,
 			}
+
+			// During the migration away from the legacy unique names, the
+			// configuration also serves every policy under its legacy name.
+			addLegacyPolicyEntries(policiesMap, []policiesv1.Policy{
+				admissionPolicy,
+				clusterAdmissionPolicy,
+				admissionPolicyGroup,
+				clusterPolicyGroup,
+			}, logr.Discard())
 
 			policies, err := json.Marshal(policiesMap)
 			Expect(err).ToNot(HaveOccurred())
@@ -711,6 +752,69 @@ var _ = Describe("PolicyServer controller", func() {
 			}, timeout, pollInterval).Should(Succeed())
 		})
 
+		It("should use all custom ports", func() {
+			policyServer := policiesv1.NewPolicyServerFactory().
+				WithName(policyServerName).
+				WithWebhookPort(9443).
+				WithReadinessProbePort(9081).
+				WithMetricsPort(9080).
+				Build()
+			createPolicyServerAndWaitForItsService(ctx, policyServer)
+
+			By("checking all custom port env vars in the deployment")
+			Eventually(func() error {
+				deployment, err := getTestPolicyServerDeployment(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				container := deployment.Spec.Template.Spec.Containers[0]
+				envMap := make(map[string]string)
+				for _, env := range container.Env {
+					envMap[env.Name] = env.Value
+				}
+
+				Expect(envMap).To(HaveKeyWithValue("KUBEWARDEN_PORT", strconv.Itoa(9443)))
+				Expect(envMap).To(HaveKeyWithValue("KUBEWARDEN_READINESS_PROBE_PORT", strconv.Itoa(9081)))
+				Expect(envMap).To(HaveKeyWithValue(constants.PolicyServerEnableMetricsEnvVar, "true"))
+
+				By("checking readiness probe port")
+				Expect(container.ReadinessProbe).ToNot(BeNil())
+				Expect(container.ReadinessProbe.HTTPGet).ToNot(BeNil())
+				Expect(container.ReadinessProbe.HTTPGet.Port).To(Equal(intstr.FromInt32(9081)))
+
+				return nil
+			}, timeout, pollInterval).Should(Succeed())
+
+			By("checking the service targetPort matches custom webhook port")
+			Eventually(func() error {
+				service, err := getTestPolicyServerService(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				Expect(service.Spec.Ports).To(ContainElement(MatchFields(IgnoreExtras, Fields{
+					"Name":       Equal("policy-server"),
+					"Port":       Equal(int32(constants.PolicyServerServicePort)),
+					"TargetPort": Equal(intstr.FromInt32(9443)),
+				})))
+				return nil
+			}, timeout, pollInterval).Should(Succeed())
+
+			By("checking the service metrics port matches custom metrics port")
+			Eventually(func() error {
+				service, err := getTestPolicyServerService(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				Expect(service.Spec.Ports).To(ContainElement(MatchFields(IgnoreExtras, Fields{
+					"Name":       Equal("metrics"),
+					"Port":       Equal(int32(9080)),
+					"TargetPort": Equal(intstr.FromInt32(constants.PolicyServerMetricsPort)),
+					"Protocol":   Equal(corev1.ProtocolTCP),
+				})))
+				return nil
+			}, timeout, pollInterval).Should(Succeed())
+		})
+
 		It("should create deployment with owner reference", func() {
 			policyServer := policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()
 			createPolicyServerAndWaitForItsService(ctx, policyServer)
@@ -886,6 +990,180 @@ var _ = Describe("PolicyServer controller", func() {
 				"Name":      Equal(clientCAVolumeName),
 				"MountPath": Equal(clientCAVolumePath),
 			})))
+		})
+
+		It("should propagate custom labels from spec.labels to the Deployment and Pod template, with system labels taking precedence", func() {
+			policyServer := policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()
+			policyServer.Spec.Labels = map[string]string{
+				"custom-label":                 "custom-value",
+				"another-label":                "another-value",
+				constants.PolicyServerLabelKey: "should-be-overridden",
+				"app.kubernetes.io/managed-by": "should-be-overridden",
+			}
+			createPolicyServerAndWaitForItsService(ctx, policyServer)
+
+			Eventually(func() error {
+				deployment, err := getTestPolicyServerDeployment(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				// Custom labels should appear on Deployment ObjectMeta
+				Expect(deployment.ObjectMeta.Labels).To(HaveKeyWithValue("custom-label", "custom-value"))
+				Expect(deployment.ObjectMeta.Labels).To(HaveKeyWithValue("another-label", "another-value"))
+				// Custom labels should appear on Pod template
+				Expect(deployment.Spec.Template.ObjectMeta.Labels).To(HaveKeyWithValue("custom-label", "custom-value"))
+				Expect(deployment.Spec.Template.ObjectMeta.Labels).To(HaveKeyWithValue("another-label", "another-value"))
+				// System labels must not be overridden by user labels
+				Expect(deployment.ObjectMeta.Labels).To(HaveKeyWithValue(constants.PolicyServerLabelKey, policyServerName))
+				Expect(deployment.ObjectMeta.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "kubewarden-controller"))
+				Expect(deployment.Spec.Template.ObjectMeta.Labels).To(HaveKeyWithValue(constants.PolicyServerLabelKey, policyServerName))
+				Expect(deployment.Spec.Template.ObjectMeta.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "kubewarden-controller"))
+				return nil
+			}).Should(Succeed())
+		})
+
+		It("should propagate custom annotations from spec.annotations to the Deployment ObjectMeta and Pod template", func() {
+			policyServer := policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()
+			policyServer.Spec.Annotations = map[string]string{
+				"custom-annotation":  "custom-value",
+				"another-annotation": "another-value",
+			}
+			createPolicyServerAndWaitForItsService(ctx, policyServer)
+
+			Eventually(func() error {
+				deployment, err := getTestPolicyServerDeployment(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				// Custom annotations should appear on Deployment ObjectMeta
+				Expect(deployment.ObjectMeta.Annotations).To(HaveKeyWithValue("custom-annotation", "custom-value"))
+				Expect(deployment.ObjectMeta.Annotations).To(HaveKeyWithValue("another-annotation", "another-value"))
+				// Custom annotations should appear on Pod template
+				Expect(deployment.Spec.Template.ObjectMeta.Annotations).To(HaveKeyWithValue("custom-annotation", "custom-value"))
+				Expect(deployment.Spec.Template.ObjectMeta.Annotations).To(HaveKeyWithValue("another-annotation", "another-value"))
+				// System annotation must still be present
+				Expect(deployment.ObjectMeta.Annotations).To(HaveKey(constants.PolicyServerDeploymentConfigVersionAnnotation))
+				return nil
+			}).Should(Succeed())
+		})
+
+		It("should remove stale labels and annotations from the Deployment when they are removed from spec", func() {
+			policyServer := policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()
+			policyServer.Spec.Labels = map[string]string{"stale-label": "value"}
+			policyServer.Spec.Annotations = map[string]string{"stale-annotation": "value"}
+			createPolicyServerAndWaitForItsService(ctx, policyServer)
+
+			// Confirm they appear initially on both Deployment ObjectMeta and Pod template
+			Eventually(func() error {
+				deployment, err := getTestPolicyServerDeployment(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				if _, ok := deployment.ObjectMeta.Labels["stale-label"]; !ok {
+					return errors.New("stale-label not yet present on Deployment ObjectMeta")
+				}
+				if _, ok := deployment.ObjectMeta.Annotations["stale-annotation"]; !ok {
+					return errors.New("stale-annotation not yet present on Deployment ObjectMeta")
+				}
+				if _, ok := deployment.Spec.Template.ObjectMeta.Labels["stale-label"]; !ok {
+					return errors.New("stale-label not yet present on Pod template")
+				}
+				if _, ok := deployment.Spec.Template.ObjectMeta.Annotations["stale-annotation"]; !ok {
+					return errors.New("stale-annotation not yet present on Pod template")
+				}
+				return nil
+			}, timeout, pollInterval).Should(Succeed())
+
+			// Remove both from spec
+			Eventually(func() error {
+				ps, err := getTestPolicyServer(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				ps.Spec.Labels = nil
+				ps.Spec.Annotations = nil
+				return k8sClient.Update(ctx, ps)
+			}, timeout, pollInterval).Should(Succeed())
+
+			// Verify they are gone from both Deployment ObjectMeta and Pod template
+			Eventually(func() error {
+				deployment, err := getTestPolicyServerDeployment(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				if _, ok := deployment.ObjectMeta.Labels["stale-label"]; ok {
+					return errors.New("stale-label still present on Deployment ObjectMeta after removal from spec")
+				}
+				if _, ok := deployment.ObjectMeta.Annotations["stale-annotation"]; ok {
+					return errors.New("stale-annotation still present on Deployment ObjectMeta after removal from spec")
+				}
+				if _, ok := deployment.Spec.Template.ObjectMeta.Labels["stale-label"]; ok {
+					return errors.New("stale-label still present on Pod template after removal from spec")
+				}
+				if _, ok := deployment.Spec.Template.ObjectMeta.Annotations["stale-annotation"]; ok {
+					return errors.New("stale-annotation still present on Pod template after removal from spec")
+				}
+				// System labels and annotations must still be present
+				Expect(deployment.ObjectMeta.Labels).To(HaveKey(constants.PolicyServerLabelKey))
+				Expect(deployment.ObjectMeta.Annotations).To(HaveKey(constants.PolicyServerDeploymentConfigVersionAnnotation))
+				Expect(deployment.Spec.Template.ObjectMeta.Labels).To(HaveKey(constants.PolicyServerLabelKey))
+				return nil
+			}, timeout, pollInterval).Should(Succeed())
+		})
+
+		It("should preserve non-user-managed annotations on the Deployment when reconciling", func() {
+			policyServer := policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()
+			policyServer.Spec.Annotations = map[string]string{"user-annotation": "user-value"}
+			createPolicyServerAndWaitForItsService(ctx, policyServer)
+
+			// Wait for the user annotation to appear on the Deployment.
+			Eventually(func() error {
+				deployment, err := getTestPolicyServerDeployment(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				if _, ok := deployment.ObjectMeta.Annotations["user-annotation"]; !ok {
+					return errors.New("user-annotation not yet present on Deployment ObjectMeta")
+				}
+				return nil
+			}, timeout, pollInterval).Should(Succeed())
+
+			// Simulate an external controller (e.g. Kubernetes deployment controller) adding
+			// an annotation directly to the Deployment.
+			const externalAnnotation = "some-external-tool/annotation"
+			Eventually(func() error {
+				deployment, err := getTestPolicyServerDeployment(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				deployment.ObjectMeta.Annotations[externalAnnotation] = "external-value"
+				return k8sClient.Update(ctx, deployment)
+			}, timeout, pollInterval).Should(Succeed())
+
+			// Trigger a reconcile by updating the PolicyServer spec (remove the user annotation).
+			Eventually(func() error {
+				ps, err := getTestPolicyServer(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				ps.Spec.Annotations = nil
+				return k8sClient.Update(ctx, ps)
+			}, timeout, pollInterval).Should(Succeed())
+
+			// The user annotation must be gone, but the external annotation must survive.
+			Eventually(func() error {
+				deployment, err := getTestPolicyServerDeployment(ctx, policyServerName)
+				if err != nil {
+					return err
+				}
+				if _, ok := deployment.ObjectMeta.Annotations["user-annotation"]; ok {
+					return errors.New("user-annotation still present after removal from spec")
+				}
+				if _, ok := deployment.ObjectMeta.Annotations[externalAnnotation]; !ok {
+					return errors.New("external annotation was unexpectedly removed by the controller")
+				}
+				return nil
+			}, timeout, pollInterval).Should(Succeed())
 		})
 
 		It("should set the configMap version as a deployment annotation", func() {
@@ -1582,90 +1860,96 @@ var _ = Describe("PolicyServer controller", func() {
 				)
 			})
 
-			It("should delete assigned policies", func() {
+			It("should set assigned policies as scheduled and remove their webhook configuration", func() {
+				policy, err := getTestClusterAdmissionPolicy(ctx, policyName)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Manually create the ValidatingWebhookConfiguration to simulate
+				// the policy being active. In envtest there are no running pods so
+				// policies never reach the active status and the webhook is never
+				// created by the controller.
+				webhook := &admissionregistrationv1.ValidatingWebhookConfiguration{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: policy.GetUniqueName(),
+						Labels: map[string]string{
+							constants.PartOfLabelKey: constants.PartOfLabelValue,
+						},
+					},
+					Webhooks: []admissionregistrationv1.ValidatingWebhook{
+						{
+							Name:                    policy.GetUniqueName() + constants.WebhookNameSuffix,
+							AdmissionReviewVersions: []string{"v1"},
+							SideEffects: func() *admissionregistrationv1.SideEffectClass {
+								s := admissionregistrationv1.SideEffectClassNone
+								return &s
+							}(),
+							ClientConfig: admissionregistrationv1.WebhookClientConfig{
+								Service: &admissionregistrationv1.ServiceReference{
+									Namespace: deploymentsNamespace,
+									Name:      policyServerName,
+								},
+							},
+						},
+					},
+				}
+				Expect(k8sClient.Create(ctx, webhook)).To(Succeed())
+
 				Expect(
 					k8sClient.Delete(ctx, policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()),
 				).To(Succeed())
 
+				// Policy should transition to scheduled.
 				Eventually(func() (*policiesv1.ClusterAdmissionPolicy, error) {
 					return getTestClusterAdmissionPolicy(ctx, policyName)
+				}, timeout, pollInterval).Should(
+					HaveField("Status.PolicyStatus", Equal(policiesv1.PolicyStatusScheduled)),
+				)
+
+				// The ValidatingWebhookConfiguration must be removed so orphaned
+				// webhooks don't block admission requests.
+				Eventually(func() error {
+					got := admissionregistrationv1.ValidatingWebhookConfiguration{}
+					return k8sClient.Get(ctx, types.NamespacedName{Name: policy.GetUniqueName()}, &got)
+				}, timeout, pollInterval).ShouldNot(Succeed())
+
+				// Once the webhook is gone the PolicyWebhooksCleanedUp condition
+				// must be True and the finalizer must be removed.
+				Eventually(func() (*policiesv1.PolicyServer, error) {
+					return getTestPolicyServer(ctx, policyServerName)
+				}, timeout, pollInterval).Should(And(
+					HaveField("Finalizers", Not(ContainElement(constants.KubewardenFinalizer))),
+					HaveField("Status.Conditions", ContainElement(And(
+						HaveField("Type", string(policiesv1.PolicyServerPolicyWebhooksCleanedUp)),
+						HaveField("Status", metav1.ConditionTrue),
+					))),
+				))
+			})
+
+			It("should not delete assigned policies", func() {
+				Expect(
+					k8sClient.Delete(ctx, policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()),
+				).To(Succeed())
+
+				// No webhook exists so the finalizer should be removed once the
+				// controller confirms there are no outstanding webhook configurations.
+				Eventually(func() (*policiesv1.PolicyServer, error) {
+					return getTestPolicyServer(ctx, policyServerName)
 				}, timeout, pollInterval).ShouldNot(
+					HaveField("Finalizers", ContainElement(constants.KubewardenFinalizer)),
+				)
+
+				// Assigned policies should NOT be deleted by the controller
+				Consistently(func() (*policiesv1.ClusterAdmissionPolicy, error) {
+					return getTestClusterAdmissionPolicy(ctx, policyName)
+				}, "5s", pollInterval).Should(
 					HaveField("DeletionTimestamp", BeNil()),
 				)
 			})
 
-			It("should get its old not domain-qualidied finalizer removed from policies", func() {
-				Eventually(func() error {
-					policy, err := getTestClusterAdmissionPolicy(ctx, policyName)
-					if err != nil {
-						return err
-					}
-					controllerutil.AddFinalizer(policy, constants.KubewardenFinalizerPre114)
-					return k8sClient.Update(ctx, policy)
-				}, timeout, pollInterval).Should(Succeed())
-				Eventually(func() error {
-					policy, err := getTestClusterAdmissionPolicy(ctx, policyName)
-					if err != nil {
-						return err
-					}
-					if controllerutil.ContainsFinalizer(policy, constants.KubewardenFinalizerPre114) {
-						return nil
-					}
-					return errors.New("old finalizer not found")
-				}, timeout, pollInterval).Should(Succeed())
-
-				Expect(
-					k8sClient.Delete(ctx, policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()),
-				).To(Succeed())
-
-				Eventually(func() (*policiesv1.ClusterAdmissionPolicy, error) {
-					return getTestClusterAdmissionPolicy(ctx, policyName)
-				}, timeout, pollInterval).Should(And(
-					HaveField("DeletionTimestamp", Not(BeNil())),
-					HaveField("Finalizers", Not(ContainElement(constants.KubewardenFinalizer))),
-					HaveField("Finalizers", Not(ContainElement(constants.KubewardenFinalizerPre114))),
-					HaveField("Finalizers", ContainElement(integrationTestsFinalizer)),
-				))
-			})
-
-			It("should not delete its managed resources until all the scheduled policies are gone", func() {
-				Expect(
-					k8sClient.Delete(ctx, policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()),
-				).To(Succeed())
-
-				Eventually(func() (*policiesv1.ClusterAdmissionPolicy, error) {
-					return getTestClusterAdmissionPolicy(ctx, policyName)
-				}).Should(And(
-					HaveField("DeletionTimestamp", Not(BeNil())),
-					HaveField("Finalizers", Not(ContainElement(constants.KubewardenFinalizer))),
-					HaveField("Finalizers", ContainElement(integrationTestsFinalizer)),
-				))
-
-				Eventually(func() error {
-					_, err := getTestPolicyServerService(ctx, policyServerName)
-					return err
-				}).Should(Succeed())
-			})
-
 			It(fmt.Sprintf("should get its %q finalizer removed", constants.KubewardenFinalizer), func() {
-				Eventually(func() error {
-					policy, err := getTestClusterAdmissionPolicy(ctx, policyName)
-					if err != nil {
-						return err
-					}
-					controllerutil.RemoveFinalizer(policy, integrationTestsFinalizer)
-					return k8sClient.Update(ctx, policy)
-				}).Should(Succeed())
-
 				Expect(
 					k8sClient.Delete(ctx, policiesv1.NewPolicyServerFactory().WithName(policyServerName).Build()),
 				).To(Succeed())
-
-				// wait for the reconciliation loop of the ClusterAdmissionPolicy to remove the resource
-				Eventually(func() error {
-					_, err := getTestClusterAdmissionPolicy(ctx, policyName)
-					return err
-				}, timeout, pollInterval).ShouldNot(Succeed())
 
 				Eventually(func() (*policiesv1.PolicyServer, error) {
 					return getTestPolicyServer(ctx, policyServerName)

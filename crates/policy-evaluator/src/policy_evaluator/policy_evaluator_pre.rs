@@ -1,9 +1,11 @@
 use std::result::Result;
 
-use crate::errors::PolicyEvaluatorPreError;
-use crate::evaluation_context::EvaluationContext;
-use crate::policy_evaluator::{PolicyEvaluator, stack_pre::StackPre};
-use crate::runtimes::{Runtime, rego, wapc, wasi_cli};
+use crate::{
+    errors::PolicyEvaluatorPreError,
+    evaluation_context::EvaluationContext,
+    policy_evaluator::{PolicyEvaluator, stack_pre::StackPre},
+    runtimes::{Runtime, ferricel, rego, wapc, wasi_cli},
+};
 
 /// This struct provides a way to quickly allocate a `PolicyEvaluator`
 /// object.
@@ -44,6 +46,10 @@ impl PolicyEvaluatorPre {
                 let rego_stack = rego::Stack::new_from_pre(stack_pre, eval_ctx)
                     .map_err(PolicyEvaluatorPreError::RehydrateRego)?;
                 Runtime::Rego(Box::new(rego_stack))
+            }
+            StackPre::Ferricel(stack_pre) => {
+                let ferricel_stack = ferricel::Stack::new_from_pre(stack_pre, eval_ctx);
+                Runtime::Ferricel(ferricel_stack)
             }
         };
 

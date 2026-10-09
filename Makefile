@@ -1,7 +1,7 @@
 CONTROLLER_TOOLS_VERSION := v0.18.0
 ENVTEST_VERSION := release-0.19
 ENVTEST_K8S_VERSION := 1.31.0
-HELM_VALUES_SCHEMA_JSON_VERSION := v2.3.1
+HELM_VALUES_SCHEMA_JSON_VERSION := v2.4.0
 
 CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
 ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_VERSION)
@@ -13,7 +13,7 @@ GO_BUILD_ENV := CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 ENVTEST_DIR ?= $(shell pwd)/.envtest
 
 REGISTRY ?= ghcr.io
-REPO ?= kubewarden
+REPO ?= kubewarden/adm-controller
 TAG ?= dev
 
 # Detect architecture for Rust builds
@@ -46,13 +46,20 @@ test-rust:
 
 .PHONY: helm-unittest
 helm-unittest:
-	helm unittest charts/kubewarden-crds --file "tests/**/*_test.yaml"
-	helm unittest charts/kubewarden-controller --file "tests/**/*_test.yaml"
-	helm unittest charts/kubewarden-defaults --file "tests/**/*_test.yaml"
+	helm unittest charts/admission-controller --file "tests/**/*_test.yaml"
 
 .PHONY: test-e2e
 test-e2e: controller-image audit-scanner-image policy-server-image
-	$(GO_BUILD_ENV) go test ./e2e/ -v
+	$(MAKE) test-e2e-run
+
+# Run the e2e tests against images that already exist in the local
+# docker daemon (for example, images that CI built and loaded).
+.PHONY: test-e2e-run
+test-e2e-run:
+	$(GO_BUILD_ENV) go test ./e2e/ -v -timeout 45m
+
+.PHONY: test-all
+test-all: test helm-unittest test-e2e
 
 .PHONY: fmt-go
 fmt-go:
@@ -91,7 +98,7 @@ advisories-rust:
 
 .PHONY: coverage-rust
 coverage-rust:
-	cargo llvm-cov --ignore-run-fail --doctests --html --output-dir coverage/rust/
+	cargo llvm-cov --ignore-run-fail --html --output-dir coverage/rust/
 
 CONTROLLER_SRC_DIRS := cmd/controller api internal/controller
 CONTROLLER_GO_SRCS := $(shell find $(CONTROLLER_SRC_DIRS) -type f -name '*.go')
@@ -102,9 +109,9 @@ controller: $(CONTROLLER_SRCS) vet
 
 .PHONY: controller-image
 controller-image:
-	docker build -f ./Dockerfile.kubewarden-controller \
-		-t "$(REGISTRY)/$(REPO)/kubewarden-controller:$(TAG)" .
-	@echo "Built $(REGISTRY)/$(REPO)/kubewarden-controller:$(TAG)"
+	docker build -f ./Dockerfile.controller \
+		-t "$(REGISTRY)/$(REPO)/controller:$(TAG)" .
+	@echo "Built $(REGISTRY)/$(REPO)/controller:$(TAG)"
 
 AUDIT_SCANNER_SRC_DIRS := cmd/audit-scanner api internal/audit-scanner
 AUDIT_SCANNER_GO_SRCS := $(shell find $(AUDIT_SCANNER_SRC_DIRS) -type f -name '*.go')
@@ -140,7 +147,7 @@ kwctl: $(KWCTL_SRCS) lint-rust
 	cp ./target/$(RUST_TARGET)/release/kwctl ./bin/kwctl
 
 .PHONY: generate
-generate: generate-controller generate-chart generate-crd-docs generate-kwctl-cli-docs
+generate: generate-controller generate-chart generate-crd-docs generate-kwctl-cli-docs generate-policyserver-cli-docs
 
 .PHONY: generate-controller
 generate-controller: manifests  ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -153,40 +160,35 @@ generate-crd-docs:
 .PHONY: generate-kwctl-cli-docs
 generate-kwctl-cli-docs:
 	$(MAKE) -C crates/kwctl build-docs
+	
+.PHONY: generate-policyserver-cli-docs
+generate-policyserver-cli-docs:
+	$(MAKE) -C crates/policy-server build-docs
 
 .PHONY: manifests
 manifests: ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(GO_BUILD_ENV) $(CONTROLLER_GEN) rbac:roleName=kubewarden-controller-manager,fileName=controller-rbac-roles.yaml crd webhook \
 			paths="./api/policies/v1" paths="./api/policies/v1alpha2" \
 			paths="./internal/controller" paths="./cmd/controller" \
-			output:crd:artifacts:config=charts/kubewarden-crds/templates \
-			output:rbac:artifacts:config=charts/kubewarden-controller/templates
-	sed -i '/^metadata:/a\  labels:\n    {{- include "kubewarden-controller.labels" . | nindent 4 }}\n  annotations:\n    {{- include "kubewarden-controller.annotations" . | nindent 4 }}' charts/kubewarden-controller/templates/controller-rbac-roles.yaml
-	sed -i 's/  namespace: kubewarden/  namespace: {{ .Release.Namespace }}/' charts/kubewarden-controller/templates/controller-rbac-roles.yaml
+			output:crd:artifacts:config=charts/admission-controller/templates/crds \
+			output:rbac:artifacts:config=charts/admission-controller/templates/controller \
+			output:webhook:artifacts:config=charts
+	echo "# to be merged manually into admission-controller/templates/webhooks.yaml" | cat - charts/manifests.yaml > temp && mv temp charts/manifests.yaml
+	mv charts/manifests.yaml charts/generated-webhooks-manifests.yaml
+	sed -i '/^metadata:/a\  labels:\n    {{- include "admission-controller.labels" . | nindent 4 }}\n  annotations:\n    {{- include "admission-controller.annotations" . | nindent 4 }}' charts/admission-controller/templates/controller/controller-rbac-roles.yaml
+	sed -i 's/  namespace: kubewarden/  namespace: {{ .Release.Namespace }}/' charts/admission-controller/templates/controller/controller-rbac-roles.yaml
 
 .PHONY: generate-chart
 generate-chart: ## Generate Helm chart values schema.
-	$(HELM_SCHEMA) --values charts/kubewarden-controller/values.yaml --output charts/kubewarden-controller/values.schema.json
+	$(HELM_SCHEMA) --values charts/admission-controller/values.yaml --output charts/admission-controller/values.schema.json
+
+.PHONY: check-questions
+check-questions: ## Check that questions.yaml is in sync with values.yaml.
+	go run ./hack/check-questions
 
 .PHONY: check-generate
-check-generate: generate
+check-generate: check-questions generate
 	@./hack/check-for-auto-generated-changes.sh
-
-.PHONY: charts-check-common-values
-charts-check-common-values:
-	@./scripts/charts-check-common-values.sh
-
-.PHONY: charts-generate-images-file
-charts-generate-images-file:
-	@./scripts/charts-extract-images.sh ./charts
-
-.PHONY: charts-generate-policies-file
-charts-generate-policies-file:
-	@./scripts/charts-extract-policies.sh ./charts
-
-.PHONY: charts-generate-changelog-files
-charts-generate-changelog-files:
-	@./scripts/charts-generate-changelog-files.sh ./charts imagelist.txt
 
 ##@ Dependencies
 
@@ -196,12 +198,14 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 ## Tool Versions
-GOLANGCI_LINT_VERSION ?= v2.9.0
-ZIZMOR_VERSION ?= 1.23.1
+GOLANGCI_LINT_VERSION ?= v2.13.1
+ZIZMOR_VERSION ?= 1.30.1
+TYPOS_VERSION ?= 1.48.0
 
 ## Tool Binaries
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 ZIZMOR_LINT = $(LOCALBIN)/zizmor-$(ZIZMOR_VERSION)
+TYPOS_LINT = $(LOCALBIN)/typos-$(TYPOS_VERSION)
 
 .PHONY: zizmor
 zizmor: $(ZIZMOR_LINT) ## Run zizmor static analysis on GitHub Actions workflows
@@ -214,6 +218,19 @@ $(ZIZMOR_LINT): $(LOCALBIN)
 	mv $(LOCALBIN)/zizmor $(ZIZMOR_LINT) ;\
 	}
 
+.PHONY: typos
+typos: $(TYPOS_LINT) ## Check spelling with typos
+	$(TYPOS_LINT)
+.PHONY: typos-fix
+typos-fix: $(TYPOS_LINT) ## Check spelling with typos and apply fixes
+	$(TYPOS_LINT) -w
+$(TYPOS_LINT): $(LOCALBIN)
+	@[ -f $(TYPOS_LINT) ] || { \
+	set -e; \
+	echo "Installing typos-cli@$(TYPOS_VERSION)" ;\
+	cargo install --locked --root $(shell pwd) typos-cli@$(TYPOS_VERSION) ;\
+	mv $(LOCALBIN)/typos $(TYPOS_LINT) ;\
+	}
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.

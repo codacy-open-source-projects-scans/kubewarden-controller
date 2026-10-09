@@ -9,33 +9,36 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
 )
 
 const (
 	integrationTestsFinalizer          = "kubewarden.io/integration-tests-safety-net-finalizer"
-	defaultKubewardenRepository        = "ghcr.io/kubewarden/policy-server"
+	defaultKubewardenRepository        = "ghcr.io/kubewarden/adm-controller/policy-server"
 	maxNameSuffixLength                = 8
 	defaultPolicyGroupRejectionMessage = "policy group default rejection message"
+	defaultNamespace                   = "default"
+	testPodPrivilegedModule            = "registry://ghcr.io/kubewarden/tests/pod-privileged:v0.2.5"
+	protectPolicyMode                  = "protect"
+	podPrivilegedPolicyName            = "pod_privileged"
 )
 
 type AdmissionPolicyFactory struct {
-	name         string
-	namespace    string
-	policyServer string
-	mutating     bool
-	rules        []admissionregistrationv1.RuleWithOperations
-	module       string
-	matchConds   []admissionregistrationv1.MatchCondition
-	mode         PolicyMode
-	message      string
+	name              string
+	namespace         string
+	policyServer      string
+	mutating          bool
+	rules             []admissionregistrationv1.RuleWithOperations
+	module            string
+	matchConds        []admissionregistrationv1.MatchCondition
+	mode              PolicyMode
+	message           string
+	withoutFinalizers bool
 }
 
 func NewAdmissionPolicyFactory() *AdmissionPolicyFactory {
 	return &AdmissionPolicyFactory{
 		name:         newName("admission-policy"),
-		namespace:    "default",
+		namespace:    defaultNamespace,
 		policyServer: "",
 		message:      "",
 		mutating:     false,
@@ -48,15 +51,15 @@ func NewAdmissionPolicyFactory() *AdmissionPolicyFactory {
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
-					Resources:   []string{"Pods"},
+					Resources:   []string{"pods"}, //nolint:goconst
 				},
 			},
 		},
-		module: "registry://ghcr.io/kubewarden/tests/pod-privileged:v0.2.5",
+		module: testPodPrivilegedModule,
 		matchConds: []admissionregistrationv1.MatchCondition{
-			{Name: "noop", Expression: "true"},
+			{Name: "noop", Expression: "true"}, //nolint:goconst
 		},
-		mode: "protect",
+		mode: protectPolicyMode,
 	}
 }
 
@@ -100,20 +103,27 @@ func (f *AdmissionPolicyFactory) WithMessage(message string) *AdmissionPolicyFac
 	return f
 }
 
+func (f *AdmissionPolicyFactory) WithoutFinalizers() *AdmissionPolicyFactory {
+	f.withoutFinalizers = true
+	return f
+}
+
 func (f *AdmissionPolicyFactory) Build() *AdmissionPolicy {
+	var finalizers []string
+	if !f.withoutFinalizers {
+		finalizers = []string{
+			// Safety-net finalizer that prevents the API server from garbage-
+			// collecting the object during integration tests, so test assertions
+			// can observe the controller's behavior before deletion completes.
+			integrationTestsFinalizer,
+		}
+	}
+
 	policy := AdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      f.name,
-			Namespace: f.namespace,
-			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
-				integrationTestsFinalizer,
-			},
+			Name:       f.name,
+			Namespace:  f.namespace,
+			Finalizers: finalizers,
 		},
 		Spec: AdmissionPolicySpec{
 			PolicySpec: PolicySpec{
@@ -141,6 +151,7 @@ type ClusterAdmissionPolicyFactory struct {
 	mode                  PolicyMode
 	timeoutSeconds        *int32
 	timeoutEvalSeconds    *int32
+	withoutFinalizers     bool
 }
 
 func NewClusterAdmissionPolicyFactory() *ClusterAdmissionPolicyFactory {
@@ -157,16 +168,16 @@ func NewClusterAdmissionPolicyFactory() *ClusterAdmissionPolicyFactory {
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
-					Resources:   []string{"Pods"},
+					Resources:   []string{"pods"},
 				},
 			},
 		},
-		module:                "registry://ghcr.io/kubewarden/tests/pod-privileged:v0.2.5",
+		module:                testPodPrivilegedModule,
 		contextAwareResources: []ContextAwareResource{},
 		matchConds: []admissionregistrationv1.MatchCondition{
 			{Name: "noop", Expression: "true"},
 		},
-		mode: "protect",
+		mode: protectPolicyMode,
 	}
 }
 
@@ -215,19 +226,25 @@ func (f *ClusterAdmissionPolicyFactory) WithTimeoutEvalSeconds(timeout *int32) *
 	return f
 }
 
+func (f *ClusterAdmissionPolicyFactory) WithoutFinalizers() *ClusterAdmissionPolicyFactory {
+	f.withoutFinalizers = true
+	return f
+}
+
 func (f *ClusterAdmissionPolicyFactory) Build() *ClusterAdmissionPolicy {
+	var finalizers []string
+	if !f.withoutFinalizers {
+		finalizers = []string{
+			// Safety-net finalizer that prevents the API server from garbage-
+			// collecting the object during integration tests, so test assertions
+			// can observe the controller's behavior before deletion completes.
+			integrationTestsFinalizer,
+		}
+	}
 	clusterAdmissionPolicy := ClusterAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: f.name,
-			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
-				integrationTestsFinalizer,
-			},
+			Name:       f.name,
+			Finalizers: finalizers,
 		},
 		Spec: ClusterAdmissionPolicySpec{
 			ContextAwareResources: f.contextAwareResources,
@@ -260,7 +277,7 @@ type AdmissionPolicyGroupFactory struct {
 func NewAdmissionPolicyGroupFactory() *AdmissionPolicyGroupFactory {
 	return &AdmissionPolicyGroupFactory{
 		name:         newName("admissing-policy-group"),
-		namespace:    "default",
+		namespace:    defaultNamespace,
 		policyServer: "",
 		rules: []admissionregistrationv1.RuleWithOperations{
 			{
@@ -271,20 +288,20 @@ func NewAdmissionPolicyGroupFactory() *AdmissionPolicyGroupFactory {
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
-					Resources:   []string{"Pods"},
+					Resources:   []string{"pods"},
 				},
 			},
 		},
 		expression: "pod_privileged()",
 		policyMembers: PolicyGroupMembers{
-			"pod_privileged": {
-				Module: "registry://ghcr.io/kubewarden/tests/pod-privileged:v0.2.5",
+			podPrivilegedPolicyName: {
+				Module: testPodPrivilegedModule,
 			},
 		},
 		matchConds: []admissionregistrationv1.MatchCondition{
 			{Name: "noop", Expression: "true"},
 		},
-		mode: "protect",
+		mode: protectPolicyMode,
 	}
 }
 
@@ -324,12 +341,9 @@ func (f *AdmissionPolicyGroupFactory) Build() *AdmissionPolicyGroup {
 			Name:      f.name,
 			Namespace: f.namespace,
 			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
+				// Safety-net finalizer that prevents the API server from garbage-
+				// collecting the object during integration tests, so test assertions
+				// can observe the controller's behavior before deletion completes.
 				integrationTestsFinalizer,
 			},
 		},
@@ -375,7 +389,7 @@ func NewClusterAdmissionPolicyGroupFactory() *ClusterAdmissionPolicyGroupFactory
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
-					Resources:   []string{"Pods"},
+					Resources:   []string{"pods"},
 				},
 			},
 		},
@@ -383,7 +397,7 @@ func NewClusterAdmissionPolicyGroupFactory() *ClusterAdmissionPolicyGroupFactory
 		policyMembers: PolicyGroupMembersWithContext{
 			"pod_privileged": {
 				PolicyGroupMember: PolicyGroupMember{
-					Module: "registry://ghcr.io/kubewarden/tests/pod-privileged:v0.2.5",
+					Module: testPodPrivilegedModule,
 				},
 			},
 			"user_group_psp": {
@@ -395,7 +409,7 @@ func NewClusterAdmissionPolicyGroupFactory() *ClusterAdmissionPolicyGroupFactory
 		matchConds: []admissionregistrationv1.MatchCondition{
 			{Name: "noop", Expression: "true"},
 		},
-		mode: "protect",
+		mode: protectPolicyMode,
 	}
 }
 
@@ -451,12 +465,9 @@ func (f *ClusterAdmissionPolicyGroupFactory) Build() *ClusterAdmissionPolicyGrou
 		ObjectMeta: metav1.ObjectMeta{
 			Name: f.name,
 			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
+				// Safety-net finalizer that prevents the API server from garbage-
+				// collecting the object during integration tests, so test assertions
+				// can observe the controller's behavior before deletion completes.
 				integrationTestsFinalizer,
 			},
 		},
@@ -487,6 +498,10 @@ type PolicyServerBuilder struct {
 	requests                       corev1.ResourceList
 	sigstoreTrustConfigMap         string
 	namespacedPoliciesCapabilities []string
+	webhookPort                    *int32
+	readinessProbePort             *int32
+	metricsPort                    *int32
+	withoutFinalizers              bool
 }
 
 func NewPolicyServerFactory() *PolicyServerBuilder {
@@ -535,19 +550,40 @@ func (f *PolicyServerBuilder) WithNamespacedPoliciesCapabilities(capabilities []
 	return f
 }
 
+func (f *PolicyServerBuilder) WithWebhookPort(port int32) *PolicyServerBuilder {
+	f.webhookPort = &port
+	return f
+}
+
+func (f *PolicyServerBuilder) WithReadinessProbePort(port int32) *PolicyServerBuilder {
+	f.readinessProbePort = &port
+	return f
+}
+
+func (f *PolicyServerBuilder) WithMetricsPort(port int32) *PolicyServerBuilder {
+	f.metricsPort = &port
+	return f
+}
+
+func (f *PolicyServerBuilder) WithoutFinalizers() *PolicyServerBuilder {
+	f.withoutFinalizers = true
+	return f
+}
+
 func (f *PolicyServerBuilder) Build() *PolicyServer {
+	var finalizers []string
+	if !f.withoutFinalizers {
+		finalizers = []string{
+			// Safety-net finalizer that prevents the API server from garbage-
+			// collecting the object during integration tests, so test assertions
+			// can observe the controller's behavior before deletion completes.
+			integrationTestsFinalizer,
+		}
+	}
 	policyServer := PolicyServer{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: f.name,
-			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
-				integrationTestsFinalizer,
-			},
+			Name:       f.name,
+			Finalizers: finalizers,
 		},
 		Spec: PolicyServerSpec{
 			Image:                          policyServerRepository() + ":" + policyServerVersion(),
@@ -559,6 +595,9 @@ func (f *PolicyServerBuilder) Build() *PolicyServer {
 			Requests:                       f.requests,
 			SigstoreTrustConfig:            f.sigstoreTrustConfigMap,
 			NamespacedPoliciesCapabilities: f.namespacedPoliciesCapabilities,
+			WebhookPort:                    f.webhookPort,
+			ReadinessProbePort:             f.readinessProbePort,
+			MetricsPort:                    f.metricsPort,
 			Env: []corev1.EnvVar{
 				{
 					Name:  "KUBEWARDEN_LOG_LEVEL",

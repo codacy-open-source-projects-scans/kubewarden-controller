@@ -6,6 +6,8 @@ use kubewarden_policy_sdk::host_capabilities::{
 use pki_types::{CertificateDer, TrustAnchor, UnixTime, pem::PemObject};
 use webpki::{EndEntityCert, Error};
 
+use crate::callback_handler::cache_return::Return;
+
 const CERTIFICATE_USED_AFTER_EXPIRATION: &str =
     "Certificate is being used after its expiration date";
 const CERTIFICATE_USED_BEFORE_VALIDITY: &str = "Certificate is being used before its validity date";
@@ -31,7 +33,7 @@ fn get_certificate_der<'a>(cert: &'a Certificate) -> Result<CertificateDer<'a>> 
 /// of the root CA. Intermediate CAs are checked for expiration.
 pub fn verify_certificate(
     req: CertificateVerificationRequest,
-) -> Result<cached::Return<CertificateVerificationResponse>> {
+) -> Result<Return<CertificateVerificationResponse>> {
     let cert_der = get_certificate_der(&req.cert)?;
     let end_entity_certificate = EndEntityCert::try_from(&cert_der)
         .map_err(|e| anyhow!("Certificate is not a valid end-entity certificate: {}", e))?;
@@ -64,7 +66,7 @@ fn verify_cert_chain(
     cert_chain: Option<Vec<Certificate>>,
     end_entity_certificate: EndEntityCert,
     verification_time: UnixTime,
-) -> Result<cached::Return<CertificateVerificationResponse>> {
+) -> Result<Return<CertificateVerificationResponse>> {
     let cert_pool = match &cert_chain {
         None => CertificatePool::from_webpki_roots(),
         Some(chain) => CertificatePool::from_certificates(chain),
@@ -83,54 +85,38 @@ fn verify_cert_chain(
     );
 
     match verification_result {
-        Ok(_) => Ok(cached::Return {
-            value: CertificateVerificationResponse {
-                trusted: true,
-                reason: "".to_string(),
-            },
-            was_cached: false,
-        }),
-        Err(Error::InvalidSignatureForPublicKey) => Ok(cached::Return {
-            value: CertificateVerificationResponse {
+        Ok(_) => Ok(Return::not_cached(CertificateVerificationResponse {
+            trusted: true,
+            reason: "".to_string(),
+        })),
+        Err(Error::InvalidSignatureForPublicKey) => {
+            Ok(Return::not_cached(CertificateVerificationResponse {
                 trusted: false,
                 reason: CERTIFICATE_NOT_TRUSTED_BY_CHAIN.to_string(),
-            },
-            was_cached: false,
-        }),
+            }))
+        }
         Err(Error::CertExpired {
             time: _,
             not_after: _,
-        }) => Ok(cached::Return {
-            value: CertificateVerificationResponse {
-                trusted: false,
-                reason: CERTIFICATE_USED_AFTER_EXPIRATION.to_string(),
-            },
-            was_cached: false,
-        }),
+        }) => Ok(Return::not_cached(CertificateVerificationResponse {
+            trusted: false,
+            reason: CERTIFICATE_USED_AFTER_EXPIRATION.to_string(),
+        })),
         Err(Error::CertNotValidYet {
             time: _,
             not_before: _,
-        }) => Ok(cached::Return {
-            value: CertificateVerificationResponse {
-                trusted: false,
-                reason: CERTIFICATE_USED_BEFORE_VALIDITY.to_string(),
-            },
-            was_cached: false,
-        }),
-        Err(Error::UnknownIssuer) => Ok(cached::Return {
-            value: CertificateVerificationResponse {
-                trusted: false,
-                reason: CERTIFICATE_NOT_TRUSTED_BY_CHAIN.to_string(),
-            },
-            was_cached: false,
-        }),
-        Err(e) => Ok(cached::Return {
-            value: CertificateVerificationResponse {
-                trusted: false,
-                reason: format!("Certificate not trusted: {}", e),
-            },
-            was_cached: false,
-        }),
+        }) => Ok(Return::not_cached(CertificateVerificationResponse {
+            trusted: false,
+            reason: CERTIFICATE_USED_BEFORE_VALIDITY.to_string(),
+        })),
+        Err(Error::UnknownIssuer) => Ok(Return::not_cached(CertificateVerificationResponse {
+            trusted: false,
+            reason: CERTIFICATE_NOT_TRUSTED_BY_CHAIN.to_string(),
+        })),
+        Err(e) => Ok(Return::not_cached(CertificateVerificationResponse {
+            trusted: false,
+            reason: format!("Certificate not trusted: {}", e),
+        })),
     }
 }
 
@@ -191,17 +177,19 @@ impl KeyUsageAlwaysValid {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use chrono::Utc;
-    use kubewarden_policy_sdk::host_capabilities::crypto::{Certificate, CertificateEncoding};
-    use kubewarden_policy_sdk::host_capabilities::crypto_v1::CertificateVerificationRequest;
+    use kubewarden_policy_sdk::host_capabilities::{
+        crypto::{Certificate, CertificateEncoding},
+        crypto_v1::CertificateVerificationRequest,
+    };
     use lazy_static::lazy_static;
     use rcgen::{
         CertificateParams, CertifiedKey, ExtendedKeyUsagePurpose, Issuer, KeyPair, KeyUsagePurpose,
     };
     use rstest::rstest;
     use time::{Duration, OffsetDateTime};
+
+    use super::*;
 
     lazy_static! {
         static ref ONE_YEAR_AGO: OffsetDateTime = OffsetDateTime::now_utc()

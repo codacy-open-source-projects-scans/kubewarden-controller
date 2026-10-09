@@ -18,13 +18,12 @@ import (
 	"context"
 	"fmt"
 
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/go-logr/logr"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 // SetupWebhookWithManager registers the ClusterAdmissionPolicy webhook with the controller manager.
@@ -59,9 +58,6 @@ func (d *clusterAdmissionPolicyDefaulter) Default(_ context.Context, clusterAdmi
 
 	if clusterAdmissionPolicy.Spec.PolicyServer == "" {
 		clusterAdmissionPolicy.Spec.PolicyServer = constants.DefaultPolicyServer
-	}
-	if clusterAdmissionPolicy.ObjectMeta.DeletionTimestamp == nil {
-		controllerutil.AddFinalizer(clusterAdmissionPolicy, constants.KubewardenFinalizer)
 	}
 
 	return nil

@@ -10,10 +10,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 //+kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations,verbs=create;delete;get;list;patch;watch
@@ -58,7 +59,7 @@ func (r *policySubReconciler) reconcileValidatingWebhookConfiguration(
 
 		webhook.Webhooks = []admissionregistrationv1.ValidatingWebhook{
 			{
-				Name: policy.GetUniqueName() + ".kubewarden.admission",
+				Name: policy.GetUniqueName() + constants.WebhookNameSuffix,
 				ClientConfig: admissionregistrationv1.WebhookClientConfig{
 					Service:  &service,
 					CABundle: admissionSecret.Data[constants.CARootCert],
@@ -94,8 +95,9 @@ func (r *policySubReconciler) reconcileValidatingWebhookConfigurationDeletion(ct
 	webhook := admissionregistrationv1.ValidatingWebhookConfiguration{}
 	err := r.Get(ctx, types.NamespacedName{Name: admissionPolicy.GetUniqueName()}, &webhook)
 	if err == nil {
-		if err = r.Delete(ctx, &webhook); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("cannot delete validating webhook: %w", err)
+		deleteErr := r.Delete(ctx, &webhook, client.Preconditions{UID: &webhook.UID})
+		if deleteErr != nil && !apierrors.IsNotFound(deleteErr) && !apierrors.IsConflict(deleteErr) {
+			return fmt.Errorf("cannot delete validating webhook: %w", deleteErr)
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("cannot retrieve validating webhook: %w", err)
@@ -144,7 +146,7 @@ func (r *policySubReconciler) reconcileMutatingWebhookConfiguration(
 		}
 		webhook.Webhooks = []admissionregistrationv1.MutatingWebhook{
 			{
-				Name: policy.GetUniqueName() + ".kubewarden.admission",
+				Name: policy.GetUniqueName() + constants.WebhookNameSuffix,
 				ClientConfig: admissionregistrationv1.WebhookClientConfig{
 					Service:  &service,
 					CABundle: admissionSecret.Data[constants.CARootCert],
@@ -180,8 +182,9 @@ func (r *policySubReconciler) reconcileMutatingWebhookConfigurationDeletion(ctx 
 	webhook := admissionregistrationv1.MutatingWebhookConfiguration{}
 	err := r.Get(ctx, types.NamespacedName{Name: admissionPolicy.GetUniqueName()}, &webhook)
 	if err == nil {
-		if err = r.Delete(ctx, &webhook); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("cannot delete mutating webhook: %w", err)
+		deleteErr := r.Delete(ctx, &webhook, client.Preconditions{UID: &webhook.UID})
+		if deleteErr != nil && !apierrors.IsNotFound(deleteErr) && !apierrors.IsConflict(deleteErr) {
+			return fmt.Errorf("cannot delete mutating webhook: %w", deleteErr)
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("cannot retrieve mutating webhook: %w", err)
@@ -197,19 +200,24 @@ func (r *policySubReconciler) namespaceSelector(policy policiesv1.Policy) *metav
 			return policy.GetNamespaceSelector()
 		}
 
-		namespaceSelector := &metav1.LabelSelector{
-			MatchExpressions: []metav1.LabelSelectorRequirement{
-				{
-					Key:      "kubernetes.io/metadata.name",
-					Operator: "NotIn",
-					Values:   []string{r.deploymentsNamespace},
-				},
-			},
+		excludeControllerNamespace := metav1.LabelSelectorRequirement{
+			Key:      "kubernetes.io/metadata.name",
+			Operator: metav1.LabelSelectorOpNotIn,
+			Values:   []string{r.deploymentsNamespace},
 		}
 
-		if policy.GetNamespaceSelector() != nil {
-			namespaceSelector.MatchExpressions = append(namespaceSelector.MatchExpressions, policy.GetNamespaceSelector().MatchExpressions...)
+		// Start from a copy of the user's selector so that both MatchLabels
+		// and MatchExpressions are preserved, then add the exclusion of the
+		// controller namespace. All the requirements are ANDed together.
+		namespaceSelector := &metav1.LabelSelector{}
+		if userSelector := policy.GetNamespaceSelector(); userSelector != nil {
+			namespaceSelector = userSelector.DeepCopy()
 		}
+
+		namespaceSelector.MatchExpressions = append(
+			[]metav1.LabelSelectorRequirement{excludeControllerNamespace},
+			namespaceSelector.MatchExpressions...,
+		)
 
 		return namespaceSelector
 

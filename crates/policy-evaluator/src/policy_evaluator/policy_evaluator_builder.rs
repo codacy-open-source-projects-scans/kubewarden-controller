@@ -1,12 +1,14 @@
-use std::path::Path;
-use std::result::Result;
+use std::{borrow::Cow, collections::BTreeSet, path::Path, result::Result};
 
 use wasmtime_provider::wasmtime;
 
-use crate::errors::PolicyEvaluatorBuilderError;
-use crate::policy_evaluator::errors::InvalidUserInputError;
-use crate::policy_evaluator::{PolicyEvaluatorPre, PolicyExecutionMode, stack_pre::StackPre};
-use crate::runtimes::{rego, wapc, wasi_cli};
+use crate::{
+    errors::PolicyEvaluatorBuilderError,
+    policy_evaluator::{
+        PolicyEvaluatorPre, PolicyExecutionMode, errors::InvalidUserInputError, stack_pre::StackPre,
+    },
+    runtimes::{ferricel, rego, wapc, wasi_cli},
+};
 
 /// Configure behavior of wasmtime [epoch-based interruptions](https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.epoch_interruption)
 ///
@@ -24,6 +26,65 @@ pub(crate) struct EpochDeadlines {
     pub wapc_func: u64,
 }
 
+/// Configure limits on the resources a single policy evaluation is allowed
+/// to consume, leveraging wasmtime's
+/// [`ResourceLimiter`](https://docs.rs/wasmtime/latest/wasmtime/trait.ResourceLimiter.html)
+/// facility (via `wasmtime::StoreLimits`).
+///
+/// This can be used to prevent a malicious, or misbehaving, policy from
+/// exhausting the host's memory, for example by growing its linear memory
+/// in an unbounded loop.
+///
+/// When a limit is exceeded, the corresponding `memory.grow`/`table.grow`
+/// wasm instruction fails and returns `-1` to the guest, following the
+/// WebAssembly specification. Most language toolchains treat a failed
+/// growth as a fatal allocation failure and abort the guest, which is
+/// reported back to the host as an evaluation error. The memory/table cap
+/// itself is always enforced by the host regardless of how the guest
+/// reacts to the failed growth.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResourceLimits {
+    /// Maximum size, in bytes, that each of the module's linear memories is
+    /// allowed to grow to. This limit is applied to each linear memory
+    /// individually.
+    ///
+    /// `None` (the default) means no limit is enforced.
+    pub max_memory_size: Option<usize>,
+
+    /// Maximum number of elements each of the module's tables is allowed to
+    /// grow to. This limit is applied to each table individually.
+    ///
+    /// `None` (the default) means no limit is enforced.
+    pub max_table_elements: Option<usize>,
+}
+
+impl From<ResourceLimits> for burrego::ResourceLimits {
+    fn from(limits: ResourceLimits) -> Self {
+        Self {
+            max_memory_size: limits.max_memory_size,
+            max_table_elements: limits.max_table_elements,
+        }
+    }
+}
+
+impl From<ResourceLimits> for wasmtime_provider::ResourceLimits {
+    fn from(limits: ResourceLimits) -> Self {
+        Self {
+            max_memory_size: limits.max_memory_size,
+            max_table_elements: limits.max_table_elements,
+        }
+    }
+}
+
+impl From<ResourceLimits> for ferricel_core::runtime::ResourceLimits {
+    fn from(limits: ResourceLimits) -> Self {
+        Self {
+            max_memory_size: limits.max_memory_size,
+            max_table_elements: limits.max_table_elements,
+        }
+    }
+}
+
 /// Helper Struct that creates a `PolicyEvaluator` object
 #[derive(Default)]
 pub struct PolicyEvaluatorBuilder {
@@ -34,6 +95,7 @@ pub struct PolicyEvaluatorBuilder {
     execution_mode: Option<PolicyExecutionMode>,
     wasmtime_cache: bool,
     epoch_deadlines: Option<EpochDeadlines>,
+    resource_limits: Option<ResourceLimits>,
 }
 
 impl PolicyEvaluatorBuilder {
@@ -131,6 +193,20 @@ impl PolicyEvaluatorBuilder {
         self
     }
 
+    /// Enable enforcement of resource limits (like the maximum size of the
+    /// linear memory and tables) on the policies evaluated by this
+    /// `PolicyEvaluator`.
+    ///
+    /// Each field of `ResourceLimits` set to `None` is left unenforced (no
+    /// limit). This means calling this method with `ResourceLimits::default()`
+    /// is equivalent to not calling it at all: it's safe to always chain it
+    /// onto the builder, even when the caller has no limit configured.
+    #[must_use]
+    pub fn enable_resource_limits(mut self, resource_limits: ResourceLimits) -> Self {
+        self.resource_limits = Some(resource_limits);
+        self
+    }
+
     /// Ensure the configuration provided to the build is correct
     fn validate_user_input(&self) -> Result<(), InvalidUserInputError> {
         if self.policy_file.is_some() && self.policy_contents.is_some() {
@@ -169,12 +245,12 @@ impl PolicyEvaluatorBuilder {
 
         let stack_pre = match execution_mode {
             PolicyExecutionMode::KubewardenWapc => {
-                let wapc_stack_pre = wapc::StackPre::new(engine, module)
+                let wapc_stack_pre = wapc::StackPre::new(engine, module, self.resource_limits)
                     .map_err(PolicyEvaluatorBuilderError::NewWapcStackPre)?;
                 StackPre::from(wapc_stack_pre)
             }
             PolicyExecutionMode::Wasi => {
-                let wasi_stack_pre = wasi_cli::StackPre::new(engine, module)
+                let wasi_stack_pre = wasi_cli::StackPre::new(engine, module, self.resource_limits)
                     .map_err(PolicyEvaluatorBuilderError::NewWasiStackPre)?;
                 StackPre::from(wasi_stack_pre)
             }
@@ -184,8 +260,16 @@ impl PolicyEvaluatorBuilder {
                     module,
                     0, // currently the entrypoint is hard coded to this value
                     execution_mode.try_into()?,
+                    self.resource_limits,
                 );
                 StackPre::from(rego_stack_pre)
+            }
+            PolicyExecutionMode::Ferricel => {
+                let vap_variables = self.ferricel_module_info()?;
+                let ferricel_stack_pre =
+                    ferricel::StackPre::new(engine, module, vap_variables, self.resource_limits)
+                        .map_err(PolicyEvaluatorBuilderError::NewFerricelStackPre)?;
+                StackPre::from(ferricel_stack_pre)
             }
         };
 
@@ -231,6 +315,42 @@ impl PolicyEvaluatorBuilder {
                     .map_err(PolicyEvaluatorBuilderError::WasmModuleBuild),
             }
         }
+    }
+
+    /// Inspect the raw bytes of a compiled ferricel policy.
+    ///
+    /// Two things happen here:
+    ///   1. Make sure that the module uses the ferricel ABI version that
+    ///      this runtime supports (see [`ferricel::errors::check_abi_version`]).
+    ///   2. Read the well-known VAP variables (for example `namespaceObject`)
+    ///      that the policy references, from the `ferricel.vap-variables`
+    ///      Wasm custom section (see [`ferricel_core::vap_variables_used`]).
+    ///
+    /// Returns `None`, which means "unknown, assume every variable may be
+    /// referenced", when the raw Wasm bytes are not available. This is the
+    /// case for the `policy_module` builder input, which `policy-server`
+    /// uses: it builds evaluators from a precompiled `wasmtime::Module`, and
+    /// that type keeps neither the original Wasm bytes nor their custom
+    /// sections. In that case the ABI check does not run here. The
+    /// `policy-server` runs it when it precompiles the module.
+    fn ferricel_module_info(
+        &self,
+    ) -> Result<Option<BTreeSet<String>>, PolicyEvaluatorBuilderError> {
+        let wasm_bytes: Cow<'_, [u8]> = match (&self.policy_contents, &self.policy_file) {
+            (Some(contents), _) => Cow::Borrowed(contents.as_slice()),
+            (None, Some(file)) => Cow::Owned(
+                std::fs::read(file)
+                    .map_err(PolicyEvaluatorBuilderError::ReadPolicyFileForVapVariables)?,
+            ),
+            (None, None) => return Ok(None),
+        };
+
+        ferricel::errors::check_abi_version(&wasm_bytes)
+            .map_err(PolicyEvaluatorBuilderError::FerricelAbiVersion)?;
+
+        let vap_variables = ferricel_core::vap_variables_used(&wasm_bytes)
+            .map_err(PolicyEvaluatorBuilderError::ReadVapVariables)?;
+        Ok(Some(vap_variables.into_iter().collect()))
     }
 }
 

@@ -13,7 +13,7 @@ build: target/release/policy-server
 
 .PHONY: fmt
 fmt:
-	cargo fmt --all -- --check
+	cargo +nightly fmt --all -- --check
 
 .PHONY: lint
 lint:
@@ -74,4 +74,4 @@ docker-build: test ## Build docker image with the manager.
 
 .PHONY:build-docs
 build-docs:
-	cargo run --release -- docs --output cli-docs.md
+	cargo run --release -- docs --output cli-docs.adoc

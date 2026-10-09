@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,11 +17,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
-
-const dataType string = "Data" // only data type is supported
 
 type policyGroupMemberWithContext struct {
 	Module                string                            `json:"module"`
@@ -51,8 +50,8 @@ type policyServerConfigEntry struct {
 // handle them differently. It's not beautiful, but we do not need to change
 // other parts of the code to make it work.
 func (p *policyServerConfigEntry) UnmarshalJSON(b []byte) error {
-	type configEntry *policyServerConfigEntry
-	entry := configEntry(p)
+	type configEntry policyServerConfigEntry
+	entry := (*configEntry)(p)
 	if err := json.Unmarshal(b, entry); err != nil {
 		return errors.Join(errors.New("failed to unmarshal policy server config entry"), err)
 	}
@@ -150,6 +149,11 @@ func (r *PolicyServerReconciler) reconcilePolicyServerConfigMap(
 // Function used to update the ConfigMap data when creating or updating it.
 func (r *PolicyServerReconciler) updateConfigMapData(cfg *corev1.ConfigMap, policyServer *policiesv1.PolicyServer, policies []policiesv1.Policy) error {
 	policiesMap := buildPoliciesMap(policies, policyServer)
+	// Serve each policy also under its legacy unique name, so that webhook
+	// configurations created with the legacy names by previous versions of
+	// the controller keep working until they are migrated. This migration
+	// code can be safely removed after a few releases.
+	addLegacyPolicyEntries(policiesMap, policies, r.Log)
 	policiesYML, err := json.Marshal(policiesMap)
 	if err != nil {
 		return fmt.Errorf("cannot marshal policies: %w", err)
@@ -167,9 +171,15 @@ func (r *PolicyServerReconciler) updateConfigMapData(cfg *corev1.ConfigMap, poli
 	}
 
 	cfg.Data = data
-	cfg.ObjectMeta.Labels = map[string]string{
-		constants.PolicyServerLabelKey: policyServer.ObjectMeta.Name,
+	labels := map[string]string{
+		// PolicyServerLabelKey is used to map ConfigMap events to policy reconcile
+		// requests
+		constants.PolicyServerLabelKey: policyServer.Name,
 	}
+	// Use the same labels as other resources backing the PolicyServer, to track
+	// for deletion later on
+	maps.Copy(labels, policyServer.CommonLabels())
+	cfg.Labels = labels
 	if err = controllerutil.SetOwnerReference(policyServer, cfg, r.Client.Scheme()); err != nil {
 		return errors.Join(errors.New("failed to set policy server configmap owner reference"), err)
 	}
@@ -274,7 +284,7 @@ func buildSourcesMap(policyServer *policiesv1.PolicyServer) policyServerSourcesE
 		for _, cert := range certs {
 			sourcesEntry.SourceAuthorities[uri] = append(sourcesEntry.SourceAuthorities[uri],
 				policyServerSourceAuthority{
-					Type: dataType,
+					Type: "Data",
 					Data: cert,
 				})
 		}

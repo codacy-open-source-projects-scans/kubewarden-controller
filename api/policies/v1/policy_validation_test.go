@@ -15,89 +15,18 @@ limitations under the License.
 package v1
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
-
-func TestSensitiveResourceMatchRule(t *testing.T) {
-	sr := sensitiveResource{
-		APIGroup: "apps",
-		Resource: "deployments",
-	}
-
-	tests := []struct {
-		name      string
-		apiGroups []string
-		resources []string
-		matches   bool
-	}{
-		{
-			"with matching APIGroups and Resources",
-			[]string{"apps"},
-			[]string{"statefulsets", "deployments"},
-			true,
-		},
-		{
-			"with APIGroups using wildcard and matching Resources",
-			[]string{"*"},
-			[]string{"deployments"},
-			true,
-		},
-		{
-			"with Resources using wildcards and APIGroups matching",
-			[]string{"apps"},
-			[]string{"*"},
-			true,
-		},
-		{
-			"with Resources using double wildcards and APIGroups matching",
-			[]string{"apps"},
-			[]string{"*/*"},
-			true,
-		},
-		{
-			"with sub-Resources using wildcards and APIGroups matching",
-			[]string{"apps"},
-			[]string{"deployments/*"},
-			true,
-		},
-		{
-			"with sub-Resources and APIGroups matching",
-			[]string{"apps"},
-			[]string{"deployments/status"},
-			true,
-		},
-		{
-			"with only APIGroups matching",
-			[]string{"apps"},
-			[]string{"statefulsets"},
-			false,
-		},
-		{
-			"with APIGroups not matching and a Resopurce using wildcard",
-			[]string{""},
-			[]string{"*"},
-			false,
-		},
-		{
-			"with APIGroups not matching and a Resopurce matching",
-			[]string{"argoproj.io"},
-			[]string{"deployments"},
-			false,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			require.Equal(t, test.matches, sr.MatchesRules(test.apiGroups, test.resources))
-		})
-	}
-}
 
 func TestValidateRulesField(t *testing.T) {
 	tests := []struct {
@@ -149,7 +78,7 @@ func TestValidateRulesField(t *testing.T) {
 			NewClusterAdmissionPolicyFactory().
 				WithRules([]admissionregistrationv1.RuleWithOperations{{}}).
 				WithPolicyServer("default").Build(),
-			[]string{"spec.rules.operations: Required value: a value must be specified"},
+			[]string{"spec.rules[0].operations: Required value: a value must be specified"},
 		},
 		{
 			"with no operations",
@@ -165,7 +94,7 @@ func TestValidateRulesField(t *testing.T) {
 					},
 				}).
 				WithPolicyServer("default").Build(),
-			[]string{"spec.rules.operations: Required value: a value must be specified"},
+			[]string{"spec.rules[0].operations: Required value: a value must be specified"},
 		},
 		{
 			"with null operations",
@@ -179,7 +108,7 @@ func TestValidateRulesField(t *testing.T) {
 					},
 				}}).
 				WithPolicyServer("default").Build(),
-			[]string{"spec.rules.operations: Required value: a value must be specified"},
+			[]string{"spec.rules[0].operations: Required value: a value must be specified"},
 		},
 		{
 			"with empty operations string",
@@ -193,7 +122,7 @@ func TestValidateRulesField(t *testing.T) {
 					},
 				}}).
 				WithPolicyServer("default").Build(),
-			[]string{"spec.rules.operations[0]: Required value: must be non-empty"},
+			[]string{"spec.rules[0].operations[0]: Required value: must be non-empty"},
 		},
 		{
 			"with no apiVersion",
@@ -207,7 +136,7 @@ func TestValidateRulesField(t *testing.T) {
 					},
 				}}).
 				WithPolicyServer("default").Build(),
-			[]string{"spec.rules: Required value: apiVersions and resources must have specified values"},
+			[]string{"spec.rules[0].apiVersions: Required value: a value must be specified"},
 		},
 		{
 			"with no resources",
@@ -220,7 +149,7 @@ func TestValidateRulesField(t *testing.T) {
 						Resources:   []string{},
 					},
 				}}).WithPolicyServer("default").Build(),
-			[]string{"spec.rules: Required value: apiVersions and resources must have specified values"},
+			[]string{"spec.rules[0].resources: Required value: a value must be specified"},
 		},
 		{
 			"with empty apiVersion string",
@@ -233,7 +162,7 @@ func TestValidateRulesField(t *testing.T) {
 						Resources:   []string{"*/*"},
 					},
 				}}).WithPolicyServer("default").Build(),
-			[]string{"spec.rules.rule.apiVersions[0]: Required value: must be non-empty"},
+			[]string{"spec.rules[0].apiVersions[0]: Required value: must be non-empty"},
 		},
 		{
 			"with empty resources string",
@@ -246,7 +175,7 @@ func TestValidateRulesField(t *testing.T) {
 						Resources:   []string{""},
 					},
 				}}).WithPolicyServer("default").Build(),
-			[]string{"spec.rules.rule.resources[0]: Required value: must be non-empty"},
+			[]string{"spec.rules[0].resources[0]: Required value: must be non-empty"},
 		},
 		{
 			"with some of the resources are empty strings",
@@ -259,7 +188,30 @@ func TestValidateRulesField(t *testing.T) {
 						Resources:   []string{"", "pods"},
 					},
 				}}).WithPolicyServer("default").Build(),
-			[]string{"spec.rules.rule.resources[0]: Required value: must be non-empty"},
+			[]string{"spec.rules[0].resources[0]: Required value: must be non-empty"},
+		},
+		{
+			"with two rules. Only the second one has an empty resource",
+			NewClusterAdmissionPolicyFactory().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{""},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"pods"},
+						},
+					},
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"apps"},
+							APIVersions: []string{"v1"},
+							Resources:   []string{""},
+						},
+					},
+				}).WithPolicyServer("default").Build(),
+			[]string{"spec.rules[1].resources[0]: Required value: must be non-empty"},
 		},
 		{
 			"with all operations and API groups and resources",
@@ -290,8 +242,8 @@ func TestValidateRulesField(t *testing.T) {
 					},
 				}).Build(),
 			[]string{
-				"spec.rules.apiGroups[0]: Forbidden: apiGroups cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
-				"spec.rules.resources[0]: Forbidden: resources cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
+				"spec.rules[0].apiGroups[0]: Forbidden: apiGroups cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
+				"spec.rules[0].resources[0]: Forbidden: resources cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
 			},
 		},
 		{
@@ -308,8 +260,8 @@ func TestValidateRulesField(t *testing.T) {
 					},
 				}).Build(),
 			[]string{
-				"spec.rules.apiGroups[0]: Forbidden: apiGroups cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
-				"spec.rules.resources[0]: Forbidden: resources cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
+				"spec.rules[0].apiGroups[0]: Forbidden: apiGroups cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
+				"spec.rules[0].resources[0]: Forbidden: resources cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
 			},
 		},
 		{
@@ -320,7 +272,7 @@ func TestValidateRulesField(t *testing.T) {
 						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
 						Rule: admissionregistrationv1.Rule{
 							APIGroups:   []string{"wgpolicyk8s.io"},
-							APIVersions: []string{"*"},
+							APIVersions: []string{"v1alpha2"},
 							Resources:   []string{"policyreports"},
 						},
 					},
@@ -328,38 +280,148 @@ func TestValidateRulesField(t *testing.T) {
 			nil,
 		},
 		{
-			"targeting a PolicyReport. But an AdmissionPolicy",
+			"targeting a PolicyReport. But an AdmissionPolicy. The controller checks the allow list at reconcile time",
 			NewAdmissionPolicyFactory().
 				WithRules([]admissionregistrationv1.RuleWithOperations{
 					{
 						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
 						Rule: admissionregistrationv1.Rule{
 							APIGroups:   []string{"wgpolicyk8s.io"},
-							APIVersions: []string{"*"},
+							APIVersions: []string{"v1alpha2"},
 							Resources:   []string{"policyreports"},
 						},
 					},
 				}).Build(),
-			[]string{
-				"spec.rules: Forbidden: {APIGroup: wgpolicyk8s.io, Resource: policyreports} resources cannot be targeted by AdmissionPolicy or AdmissionPolicyGroup",
-			},
+			nil,
 		},
 		{
-			"targeting a wgpolicyk8s.io resources. But an AdmissionPolicyGroup",
+			"targeting all wgpolicyk8s.io resources. But an AdmissionPolicyGroup. A wildcard on resources alone is permitted",
 			NewAdmissionPolicyGroupFactory().
 				WithRules([]admissionregistrationv1.RuleWithOperations{
 					{
 						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
 						Rule: admissionregistrationv1.Rule{
 							APIGroups:   []string{"wgpolicyk8s.io"},
-							APIVersions: []string{"*"},
+							APIVersions: []string{"v1alpha2"},
+							Resources:   []string{"*"},
+						},
+					},
+				}).Build(),
+			nil,
+		},
+		{
+			"targeting an openreports.io Report. But a ClusterAdmissionPolicy",
+			NewClusterAdmissionPolicyFactory().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"openreports.io"},
+							APIVersions: []string{"v1alpha1"},
+							Resources:   []string{"reports"},
+						},
+					},
+				}).Build(),
+			nil,
+		},
+		{
+			"targeting an openreports.io Report. But an AdmissionPolicy. The controller checks the allow list at reconcile time",
+			NewAdmissionPolicyFactory().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"openreports.io"},
+							APIVersions: []string{"v1alpha1"},
+							Resources:   []string{"reports"},
+						},
+					},
+				}).Build(),
+			nil,
+		},
+		{
+			"with apiGroups wildcard and a matching apiVersion. But an AdmissionPolicy",
+			NewAdmissionPolicyFactory().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"*"},
+							APIVersions: []string{"v1"},
 							Resources:   []string{"*"},
 						},
 					},
 				}).Build(),
 			[]string{
-				"spec.rules: Forbidden: {APIGroup: wgpolicyk8s.io, Resource: policyreports} resources cannot be targeted by AdmissionPolicy or AdmissionPolicyGroup",
+				"spec.rules[0].apiGroups[0]: Forbidden: apiGroups cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
+				"spec.rules[0].resources[0]: Forbidden: resources cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
 			},
+		},
+		{
+			"with apiGroups wildcard and a double wildcard resource. But an AdmissionPolicy",
+			NewAdmissionPolicyFactory().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"*"},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"*/*"},
+						},
+					},
+				}).Build(),
+			[]string{
+				"spec.rules[0].apiGroups[0]: Forbidden: apiGroups cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
+				"spec.rules[0].resources[0]: Forbidden: resources cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
+			},
+		},
+		{
+			"with apiGroups wildcard and a matching apiVersion. But an AdmissionPolicyGroup",
+			NewAdmissionPolicyGroupFactory().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"*"},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"*"},
+						},
+					},
+				}).Build(),
+			[]string{
+				"spec.rules[0].apiGroups[0]: Forbidden: apiGroups cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
+				"spec.rules[0].resources[0]: Forbidden: resources cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup",
+			},
+		},
+		{
+			"with a named apiGroup and a wildcard apiVersion and resource. But an AdmissionPolicy",
+			NewAdmissionPolicyFactory().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"apps"},
+							APIVersions: []string{"*"},
+							Resources:   []string{"*"},
+						},
+					},
+				}).Build(),
+			nil,
+		},
+		{
+			"with an apiGroups wildcard and a named resource. But an AdmissionPolicy",
+			NewAdmissionPolicyFactory().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.OperationAll},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"*"},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"pods"},
+						},
+					},
+				}).Build(),
+			nil,
 		},
 	}
 
@@ -651,6 +713,65 @@ func TestValidateTimeoutSeconds(t *testing.T) {
 					require.True(t, found, "expected error containing %q, got %v", expected, errs)
 				}
 			}
+		})
+	}
+}
+
+// TestValidateUniqueNameLength verifies that a policy whose unique name,
+// combined with the webhook entry name suffix, would exceed the Kubernetes
+// DNS1123 subdomain length limit is rejected, for all four policy kinds.
+// A policy at exactly the maximum allowed length must be accepted.
+func TestValidateUniqueNameLength(t *testing.T) {
+	tests := []struct {
+		name        string
+		buildPolicy func(policyName string) Policy
+	}{
+		{
+			name: "AdmissionPolicy",
+			buildPolicy: func(policyName string) Policy {
+				return NewAdmissionPolicyFactory().WithName(policyName).WithNamespace("team").Build()
+			},
+		},
+		{
+			name: "AdmissionPolicyGroup",
+			buildPolicy: func(policyName string) Policy {
+				return NewAdmissionPolicyGroupFactory().WithName(policyName).WithNamespace("team").Build()
+			},
+		},
+		{
+			name: "ClusterAdmissionPolicy",
+			buildPolicy: func(policyName string) Policy {
+				return NewClusterAdmissionPolicyFactory().WithName(policyName).Build()
+			},
+		},
+		{
+			name: "ClusterAdmissionPolicyGroup",
+			buildPolicy: func(policyName string) Policy {
+				return NewClusterAdmissionPolicyGroupFactory().WithName(policyName).Build()
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// The unique name is built as some fixed overhead (kind token,
+			// optional namespace, dots) plus the policy name verbatim. Probe
+			// that overhead with a throwaway 1-character name, then derive
+			// the exact name length at which the webhook entry name reaches
+			// the DNS1123 subdomain length limit.
+			probe := tc.buildPolicy("x")
+			overhead := len(probe.GetUniqueName()) - len(probe.GetName())
+			maxNameLength := validation.DNS1123SubdomainMaxLength - len(constants.WebhookNameSuffix) - overhead
+			require.Positive(t, maxNameLength, "test setup error: computed a non-positive max name length")
+
+			atLimit := tc.buildPolicy(strings.Repeat("a", maxNameLength))
+			require.Nil(t, validateUniqueNameLength(atLimit),
+				"a policy name at the maximum allowed length should be accepted")
+
+			overLimit := tc.buildPolicy(strings.Repeat("a", maxNameLength+1))
+			err := validateUniqueNameLength(overLimit)
+			require.NotNil(t, err, "a policy name one character over the limit should be rejected")
+			require.Contains(t, err.Error(), fmt.Sprintf("at most %d characters long", maxNameLength))
 		})
 	}
 }

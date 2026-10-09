@@ -20,22 +20,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/go-logr/logr"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 // Warning: this controller is deployed by a helm chart which has its own
@@ -63,10 +68,23 @@ type PolicyServerReconciler struct {
 	DeploymentsNamespace                               string
 	AlwaysAcceptAdmissionReviewsInDeploymentsNamespace bool
 	ClientCAConfigMapName                              string
+	// ControllerConfigMapName is the name of the ConfigMap that holds the
+	// controller configuration. The controller reads the allow list of
+	// resources for namespaced policies from it.
+	ControllerConfigMapName string
 	// ImagePullSecrets is the list of image pull secrets to add to every
 	// policy-server Deployment, sourced from the controller's own
 	// --image-pull-secrets flag.
 	ImagePullSecrets []corev1.LocalObjectReference
+	// HostNetwork enables host network mode on PolicyServer Deployments.
+	// When true, the controller also sets dnsPolicy to ClusterFirstWithHostNet
+	// so that in-cluster DNS resolution keeps working.
+	HostNetwork bool
+	// PolicyServerMetricsPort is the global default metrics port for PolicyServer
+	// Service objects. It is populated from the KUBEWARDEN_POLICY_SERVER_SERVICES_METRICS_PORT
+	// environment variable at startup, falling back to constants.PolicyServerMetricsPort.
+	// A per-PolicyServer CRD field (spec.metricsPort) always takes priority.
+	PolicyServerMetricsPort int32
 }
 
 // TelemetryConfiguration is a struct that contains the configuration for the
@@ -94,18 +112,35 @@ func (r *PolicyServerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
+	if policyServer.ObjectMeta.DeletionTimestamp != nil {
+		return r.reconcileDeletion(ctx, &policyServer)
+	}
+
+	// Ensure the kubewarden finalizer is present before any resource backing
+	// the PolicyServer is created and once we know it's not being deleted.
+	// This also covers PolicyServers kept across a Helm uninstall/reinstall
+	// cycle, whose finalizers are stripped by the uninstall cleanup and regained
+	// here.
+	if !controllerutil.ContainsFinalizer(&policyServer, constants.KubewardenFinalizer) {
+		controllerutil.AddFinalizer(&policyServer, constants.KubewardenFinalizer)
+		if err := r.Update(ctx, &policyServer); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cannot add finalizer to policy server: %w", err)
+		}
+	}
+
+	err := r.reconcilePolicyServerCertSecret(ctx, &policyServer)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	policies, err := r.getPolicies(ctx, &policyServer)
 	if err != nil {
 		return ctrl.Result{}, errors.Join(errors.New("could not get policies"), err)
 	}
 
-	if policyServer.ObjectMeta.DeletionTimestamp != nil {
-		return r.reconcileDeletion(ctx, &policyServer, policies)
-	}
-
-	err = r.reconcilePolicyServerCertSecret(ctx, &policyServer)
+	policies, err = r.filterRejectedNamespacedPolicies(ctx, policies)
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, errors.Join(errors.New("could not filter rejected namespaced policies"), err)
 	}
 
 	if err = r.reconcilePolicyServerConfigMap(ctx, &policyServer, policies); err != nil {
@@ -224,6 +259,14 @@ func (r *PolicyServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&policiesv1.AdmissionPolicyGroup{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAdmissionPolicyGroup)).
 		Watches(&policiesv1.ClusterAdmissionPolicy{}, handler.EnqueueRequestsFromMapFunc(r.enqueueClusterAdmissionPolicy)).
 		Watches(&policiesv1.ClusterAdmissionPolicyGroup{}, handler.EnqueueRequestsFromMapFunc(r.enqueueClusterAdmissionPolicyGroup)).
+		// The controller configuration ConfigMap holds the allow list of
+		// resources for namespaced policies. A change of the allow list
+		// changes the set of policies served by every PolicyServer.
+		Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueAllPolicyServersForControllerConfigMap),
+			builder.WithPredicates(controllerConfigMapPredicate(r.DeploymentsNamespace, r.ControllerConfigMapName)),
+		).
 		Complete(r)
 	if err != nil {
 		return errors.Join(errors.New("failed enrolling controller with manager"), err)
@@ -311,6 +354,40 @@ func (r *PolicyServerReconciler) enqueueClusterAdmissionPolicyGroup(_ context.Co
 	}
 }
 
+func (r *PolicyServerReconciler) enqueueAllPolicyServersForControllerConfigMap(ctx context.Context, _ client.Object) []reconcile.Request {
+	return findAllPolicyServers(ctx, r.Client, r.Log)
+}
+
+// filterRejectedNamespacedPolicies removes from the list the namespaced
+// policies that target resources outside of the allow list. The
+// PolicyServer must not load these policies. The policy reconciler sets
+// the status of these policies to rejected.
+func (r *PolicyServerReconciler) filterRejectedNamespacedPolicies(ctx context.Context, policies []policiesv1.Policy) ([]policiesv1.Policy, error) {
+	hasNamespacedPolicies := slices.ContainsFunc(policies, func(policy policiesv1.Policy) bool {
+		return policy.GetNamespace() != ""
+	})
+	if !hasNamespacedPolicies {
+		return policies, nil
+	}
+
+	config, err := loadControllerConfig(ctx, r.Client, r.DeploymentsNamespace, r.ControllerConfigMapName, r.Log)
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := make([]policiesv1.Policy, 0, len(policies))
+	for _, policy := range policies {
+		isAllowed, disallowed := isNamespacedPolicyAllowed(policy, config.NamespacedPoliciesAllowedResources)
+		if !isAllowed {
+			r.Log.Info("namespaced policy targets resources that are not in the allow list, the policy is not added to the PolicyServer configuration",
+				"policy", policy.GetUniqueName(), "disallowedResources", disallowed)
+			continue
+		}
+		filtered = append(filtered, policy)
+	}
+	return filtered, nil
+}
+
 // getPolicies returns all admission policies, cluster admission policies,
 // admission policy groups and cluster admission policy groups bound to the
 // given policyServer.
@@ -350,15 +427,76 @@ func (r *PolicyServerReconciler) getPolicies(ctx context.Context, policyServer *
 	return policies, nil
 }
 
-func (r *PolicyServerReconciler) reconcileDeletion(ctx context.Context, policyServer *policiesv1.PolicyServer, policies []policiesv1.Policy) (ctrl.Result, error) {
-	if len(policies) != 0 {
-		// There are still policies scheduled on the PolicyServer, we have to
-		// wait for them to be completely removed before going further with the cleanup
-		return r.deletePoliciesAndRequeue(ctx, policyServer, policies)
+// reconcileDeletion waits for the webhook configurations of all bound policies
+// to be removed before releasing the PolicyServer finalizers. The
+// PolicyWebhooksCleanedUp condition tracks progress:
+//   - False: webhooks still exist; requeue with a short delay.
+//   - True: all webhooks gone; remove finalizers on the next reconcile loop so
+//     the fresh resourceVersion from the status update is used.
+func (r *PolicyServerReconciler) reconcileDeletion(ctx context.Context, policyServer *policiesv1.PolicyServer) (ctrl.Result, error) {
+	// If the condition is already True the previous reconcile already confirmed
+	// all webhooks are gone. Remove the finalizers using the freshly-fetched
+	// object (guaranteed by Reconcile calling r.Get before reaching here).
+	if apimeta.IsStatusConditionTrue(policyServer.Status.Conditions, string(policiesv1.PolicyServerPolicyWebhooksCleanedUp)) {
+		return r.removeFinalizers(ctx, policyServer)
 	}
 
+	policies, err := r.getPolicies(ctx, policyServer)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Check policies assigned to this PolicyServer and wait until their
+	// WebhookConfiguration is gone. Retry by returning and requeuing; cheaper
+	// than adding a watch on WebhookConfigurations on PolicyServers.
+	remaining := []string{}
+	for _, policy := range policies {
+		name := policy.GetUniqueName()
+		var validatingFound bool
+		validatingFound, err = r.webhookExists(ctx, name, &admissionregistrationv1.ValidatingWebhookConfiguration{})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("cannot check ValidatingWebhookConfiguration %q: %w", name, err)
+		}
+		if validatingFound {
+			remaining = append(remaining, name)
+			continue
+		}
+		var mutatingFound bool
+		mutatingFound, err = r.webhookExists(ctx, name, &admissionregistrationv1.MutatingWebhookConfiguration{})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("cannot check MutatingWebhookConfiguration %q: %w", name, err)
+		}
+		if mutatingFound {
+			remaining = append(remaining, name)
+		}
+	}
+	if len(remaining) > 0 {
+		setFalseConditionType(
+			&policyServer.Status.Conditions,
+			string(policiesv1.PolicyServerPolicyWebhooksCleanedUp),
+			fmt.Sprintf("Waiting for webhook cleanup of policies: %s", strings.Join(remaining, ", ")),
+		)
+		if err = r.Client.Status().Update(ctx, policyServer); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cannot update policy server status: %w", err)
+		}
+		return ctrl.Result{RequeueAfter: constants.TimeToRequeuePolicyReconciliation}, nil
+	}
+
+	setTrueConditionType(
+		&policyServer.Status.Conditions,
+		string(policiesv1.PolicyServerPolicyWebhooksCleanedUp),
+	)
+	if err = r.Client.Status().Update(ctx, policyServer); err != nil {
+		return ctrl.Result{}, fmt.Errorf("cannot update policy server status: %w", err)
+	}
+	// Requeue so the next reconcile fetches the object with the updated
+	// resourceVersion before calling r.Update to remove the finalizers.
+	return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // Keep Requeue, RequeueAfter doesn't do exponential back-off
+}
+
+func (r *PolicyServerReconciler) removeFinalizers(ctx context.Context, policyServer *policiesv1.PolicyServer) (ctrl.Result, error) {
 	// Remove the old finalizer used to ensure that the policy server created
-	// before this controller version is delete as well. As the upgrade path
+	// before this controller version is deleted as well. As the upgrade path
 	// supported by the Kubewarden project does not allow jumping versions, we
 	// can safely remove this line of code after a few releases.
 	controllerutil.RemoveFinalizer(policyServer, constants.KubewardenFinalizerPre114)
@@ -374,24 +512,17 @@ func (r *PolicyServerReconciler) reconcileDeletion(ctx context.Context, policySe
 	return ctrl.Result{}, nil
 }
 
-func (r *PolicyServerReconciler) deletePoliciesAndRequeue(ctx context.Context, policyServer *policiesv1.PolicyServer, policies []policiesv1.Policy) (ctrl.Result, error) {
-	deleteError := make([]error, 0)
-	for _, policy := range policies {
-		if policy.GetDeletionTimestamp() != nil {
-			// the policy is already pending deletion
-			continue
-		}
-		if err := r.Delete(ctx, policy); err != nil && !apierrors.IsNotFound(err) {
-			deleteError = append(deleteError, err)
-		}
+// webhookExists returns true if a webhook configuration with the given name
+// exists, false if it does not exist, and an error for any transient API error.
+func (r *PolicyServerReconciler) webhookExists(ctx context.Context, name string, obj client.Object) (bool, error) {
+	err := r.Client.Get(ctx, types.NamespacedName{Name: name}, obj)
+	if err == nil {
+		return true, nil
 	}
-
-	if len(deleteError) != 0 {
-		r.Log.Error(errors.Join(deleteError...), "could not remove all policies bound to policy server", "policy-server", policyServer.Name)
-		return ctrl.Result{}, fmt.Errorf("could not remove all policies bound to policy server %s", policyServer.Name)
+	if apierrors.IsNotFound(err) {
+		return false, nil
 	}
-
-	return ctrl.Result{Requeue: true}, nil
+	return false, fmt.Errorf("cannot get %T %q: %w", obj, name, err)
 }
 
 func setFalseConditionType(

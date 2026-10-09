@@ -19,7 +19,7 @@ This structure ensures a single source of truth for artifact definitions while a
 Change `updatecli/values/scms.yaml` as needed to target forks.
 
 ```console
-$ cd kubewarden-controller/
+$ cd adm-controller/
 $ export UPDATECLI_GITHUB_TOKEN=<your token>
 $ export UPDATECLI_GITHUB_OWNER=kubewarden
 $ updatecli compose apply --file updatecli/open-release-pr.yaml
@@ -36,7 +36,7 @@ Pipeline(s) run:
   * Total:      1
 
 One action to follow up:
-  * https://github.com/kubewarden/kubewarden-controller/pull/XXX
+  * https://github.com/kubewarden/adm-controller/pull/XXX
 ```
 
 ## Dependency Updates
@@ -52,6 +52,7 @@ Updates the following dependencies:
 - Policy-reporter and openreports chart versions
 - Kuberlr-kubectl image version
 - Hauler manifest with all component versions
+- The `artifacthub.io/images` annotation in `charts/admission-controller/Chart.yaml`
 
 ### Running Updates Manually
 For manual runs of all dependency updates:

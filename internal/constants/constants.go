@@ -44,9 +44,44 @@ const (
 	ComponentLabelKey               = "app.kubernetes.io/component"
 	PartOfLabelKey                  = "app.kubernetes.io/part-of"
 	PartOfLabelValue                = "kubewarden"
-	ManagedByKey                    = "app.kubernetes.io/managed-by"
+
+	// ComponentControllerLabelValue is set via Helm chart templates.
+	ComponentControllerLabelValue = "controller"
+
+	ManagedByKey = "app.kubernetes.io/managed-by"
+	// ManagedByKeyLabelValue is set via Helm chart templates.
+	ManagedByKeyLabelValue = "kubewarden-controller"
+
+	// HelmResourcePolicy and others re Helm annotations.
+	HelmResourcePolicy       = "helm.sh/resource-policy"
+	HelmMetaReleaseName      = "meta.helm.sh/release-name"
+	HelmMetaReleaseNamespace = "meta.helm.sh/release-namespace"
+
+	// DefaultsManagedByLabelKey is the label key for resources managed by DefaultsApplier.
+	DefaultsManagedByLabelKey = "kubewarden.io/managed-by"
+	// DefaultsManagedByLabelValue is the label value for resources managed by DefaultsApplier.
+	DefaultsManagedByLabelValue = "kubewarden-controller-defaults"
+
+	// DefaultDefaultsConfigMapName is the default name of the ConfigMap containing default resources.
+	DefaultDefaultsConfigMapName = "kubewarden-defaults"
+
+	// DefaultControllerConfigMapName is the default name of the ConfigMap
+	// that holds the controller configuration.
+	DefaultControllerConfigMapName = "kubewarden-controller-config"
+	// ControllerConfigKey is the key of the controller configuration
+	// ConfigMap that holds the configuration file. The file is a YAML
+	// object. For example, the key namespacedPoliciesAllowedResources of
+	// this object holds the list of resources that namespaced policies can
+	// target.
+	ControllerConfigKey = "config.yaml"
+	// ControllerConfigNamespacedPoliciesAllowedResourcesKey is the key of
+	// the controller configuration file that holds the list of resources
+	// that namespaced policies can target.
+	ControllerConfigNamespacedPoliciesAllowedResourcesKey = "namespacedPoliciesAllowedResources"
 
 	PolicyServerIndexKey = ".spec.policyServer"
+
+	KubewardenPoliciesGroup = "policies.kubewarden.io"
 
 	KubewardenFinalizerPre114 = "kubewarden"
 	KubewardenFinalizer       = "kubewarden.io/finalizer"
@@ -55,8 +90,27 @@ const (
 
 	OptelInjectAnnotation = "sidecar.opentelemetry.io/inject"
 
+	// ManagedAnnotationKeysAnnotation is the annotation used to track which annotation keys on
+	// an object are managed by the controller. On each reconcile the controller removes keys
+	// that were previously managed but are no longer desired, without touching annotations set
+	// by Kubernetes itself or other tooling.
+	ManagedAnnotationKeysAnnotation = "kubewarden.io/managed-annotation-keys"
+
+	// ManagedLabelKeysAnnotation is the annotation used to track which label keys on an object
+	// are managed by the controller. On each reconcile the controller removes keys that were
+	// previously managed but are no longer desired, without touching labels set by Kubernetes
+	// itself or other tooling.
+	ManagedLabelKeysAnnotation = "kubewarden.io/managed-label-keys"
+
 	WebhookConfigurationPolicyNameAnnotationKey      = "kubewardenPolicyName"
 	WebhookConfigurationPolicyNamespaceAnnotationKey = "kubewardenPolicyNamespace"
+
+	// WebhookNameSuffix is appended to a policy's unique name to build the
+	// name of the individual webhook entry inside a Mutating/Validating
+	// WebhookConfiguration. The resulting string cannot exceed the
+	// DNS1123Subdomain length limit, which bounds how long a policy's
+	// unique name is allowed to be.
+	WebhookNameSuffix = ".kubewarden.admission"
 
 	NamespacePolicyScope = "namespace"
 	ClusterPolicyScope   = "cluster"

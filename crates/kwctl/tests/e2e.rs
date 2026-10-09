@@ -8,12 +8,15 @@ use common::{setup_command, test_data};
 use policy_evaluator::{
     kubewarden_policy_sdk::crd::policies::{
         admission_policy, admission_policy_group, cluster_admission_policy,
-        cluster_admission_policy_group, common::ContextAwareResource as ContextAwareResourceSdk,
-        common::PolicyMode,
+        cluster_admission_policy_group,
+        common::{ContextAwareResource as ContextAwareResourceSdk, PolicyMode},
     },
     policy_fetcher, policy_metadata,
 };
-use predicates::{prelude::*, str::contains, str::is_empty, str::is_match};
+use predicates::{
+    prelude::*,
+    str::{contains, is_empty, is_match},
+};
 use rstest::rstest;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -760,9 +763,51 @@ fn test_bench() {
         .arg(test_data("unprivileged-pod.json"))
         .arg("registry://ghcr.io/kubewarden/tests/pod-privileged:v0.2.5");
 
-    cmd.assert().success();
     cmd.assert()
+        .success()
         .stdout(contains("validate").and(contains("warming up")));
+}
+
+/// `kwctl bench` reuses a single evaluator (and therefore a single replay
+/// session) across many `validate_settings()`/`evaluate()` calls. A recorded
+/// session only contains the host-capability exchanges of a single
+/// evaluation, so without resetting the replay cursor before every
+/// iteration, the session would be exhausted after the first one and every
+/// subsequent evaluation would fail with a replay error. This test asserts
+/// that this does not happen: the same session is successfully replayed for
+/// every benchmark iteration.
+#[test]
+fn test_bench_context_aware_replay_session_is_reset_every_iteration() {
+    let tempdir = tempdir().unwrap();
+    pull_policies(tempdir.path(), POLICIES);
+
+    let session_path =
+        test_data("host-capabilities-sessions/context-aware-demo-namespace-found.yml");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("bench")
+        .arg("--allow-context-aware")
+        .arg("--warm-up-time")
+        .arg("1")
+        .arg("--measurement-time")
+        .arg("1")
+        .arg("--num-samples")
+        .arg("5")
+        .arg("--request-path")
+        .arg(test_data(
+            "context-aware-policy-request-pod-creation-all-labels.json",
+        ))
+        .arg("--replay-host-capabilities-interactions")
+        .arg(session_path)
+        .arg("registry://ghcr.io/kubewarden/tests/context-aware-policy-demo:v0.1.0");
+
+    // None of the (many) evaluations performed by the bench loop should have
+    // hit an exhausted or out-of-order replay session.
+    cmd.assert()
+        .success()
+        .stdout(contains("validate").and(contains("warming up")))
+        .stderr(contains("recorded responses").not())
+        .stderr(contains("unexpected request").not());
 }
 
 #[rstest]
@@ -930,6 +975,26 @@ fn test_push() {
         .stdout(contains("my-pod-privileged-policy:v0.1.10"));
 }
 
+/// `push --force` is a flag with no value. It must not take the next
+/// argument as its value, otherwise `<policy>` and `<uri>` shift by one
+/// and clap reports a missing `<uri>`. The policy here does not exist on
+/// purpose: the test only asserts that clap parsed the two positionals.
+#[test]
+fn test_push_force_is_a_flag_without_a_value() {
+    let tempdir = tempdir().unwrap();
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("push")
+        .arg("--force")
+        .arg("missing.wasm")
+        .arg("registry://localhost:5000/missing:v0.1.0");
+
+    cmd.assert()
+        .failure()
+        .stderr(contains("Cannot find policy with uri: missing.wasm"))
+        .stderr(contains("required arguments were not provided").not());
+}
+
 #[rstest]
 #[case::pull_policies_before_scaffold(true)]
 #[case::pull_policies_on_demand(false)]
@@ -983,6 +1048,14 @@ fn test_scaffold_manifest(#[case] pull_policies_before: bool) {
     contains("module: ghcr.io/kubewarden/tests/cel-policy:1.0.0"),
     is_empty()
 )]
+#[case::vap_using_kw_k8s(
+    Some("vap/vap-with-k8s.yml"),
+    Some("vap/vap-binding.yml"),
+    Some("ghcr.io/kubewarden/tests/cel-policy:1.0.0"),
+    true,
+    contains("module: ghcr.io/kubewarden/tests/cel-policy:1.0.0"),
+    contains("this policy calls kw.k8s")
+)]
 #[case::missing_policy(
     None,
     Some("vap/vap-binding.yml"),
@@ -1033,6 +1106,291 @@ fn test_scaffold_from_vap(
 }
 
 #[rstest]
+#[case::compile_without_params(
+    "vap/vap-with-variables.yml",
+    "vap/vap-binding.yml",
+    true,
+    false,
+    "Fail"
+)]
+#[case::compile_with_params(
+    "vap/vap-with-params.yml",
+    "vap/vap-binding-params.yml",
+    true,
+    true,
+    "Fail"
+)]
+#[case::compile_with_failure_policy_ignore(
+    "vap/vap-with-failure-policy-ignore.yml",
+    "vap/vap-binding.yml",
+    true,
+    false,
+    "Ignore"
+)]
+fn test_scaffold_vap_compile_to_wasm(
+    #[case] vap_path: &str,
+    #[case] vap_binding: &str,
+    #[case] success: bool,
+    #[case] has_params: bool,
+    #[case] expected_failure_policy: &str,
+) {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data(vap_path))
+        .arg("--binding")
+        .arg(test_data(vap_binding))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    if success {
+        let output = cmd.output().unwrap();
+        assert!(output.status.success(), "command should succeed");
+        // wasm file must exist and be non-empty
+        assert!(wasm_output.exists(), "wasm output file should exist");
+        assert!(
+            wasm_output.metadata().unwrap().len() > 0,
+            "wasm output file should be non-empty"
+        );
+        // metadata.yml must exist alongside the wasm
+        let metadata_path = tempdir.path().join("metadata.yml");
+        assert!(metadata_path.exists(), "metadata.yml should be created");
+        let metadata_content = std::fs::read_to_string(&metadata_path).unwrap();
+        assert!(
+            metadata_content.contains("ferricel"),
+            "metadata.yml should contain executionMode: ferricel"
+        );
+        // stdout YAML must reference the wasm file
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("file://"), "module should be a file:// URI");
+        assert!(
+            !stdout.contains("validations:"),
+            "compiled output must not contain validations in settings"
+        );
+        assert!(
+            !stdout.contains("variables:"),
+            "compiled output must not contain variables in settings"
+        );
+        // The VAP failurePolicy must reach the ferricel runtime through the
+        // settings. The ClusterAdmissionPolicy spec.failurePolicy field is
+        // not the right place: it controls the webhook, not the policy.
+        let cap: serde_yaml::Value = serde_yaml::from_str(&stdout).unwrap();
+        assert_eq!(
+            cap["spec"]["settings"]["failurePolicy"].as_str(),
+            Some(expected_failure_policy),
+            "settings.failurePolicy must match the VAP spec.failurePolicy"
+        );
+        assert!(
+            cap["spec"]["failurePolicy"].is_null(),
+            "spec.failurePolicy must not be set by the scaffold"
+        );
+        if has_params {
+            assert!(stdout.contains("paramKind:"), "should contain paramKind");
+            assert!(stdout.contains("paramRef:"), "should contain paramRef");
+        }
+    } else {
+        cmd.assert().failure();
+    }
+}
+
+/// The binding's `spec.validationActions` maps to the generated policy's
+/// `spec.mode`: `Deny` maps to `protect` (the fixture used everywhere
+/// else in this file), `Warn`/`Audit` alone map to `monitor`.
+#[rstest]
+#[case::deny_binding("vap/vap-binding.yml", "protect")]
+#[case::warn_binding("vap/vap-binding-warn.yml", "monitor")]
+fn test_scaffold_vap_compile_to_wasm_maps_validation_actions_to_mode(
+    #[case] vap_binding: &str,
+    #[case] expected_mode: &str,
+) {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data(vap_binding))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "command should succeed");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let cap: serde_yaml::Value = serde_yaml::from_str(&stdout).unwrap();
+    assert_eq!(
+        cap["spec"]["mode"].as_str(),
+        Some(expected_mode),
+        "got: {stdout}"
+    );
+}
+
+/// Kubernetes itself rejects a binding whose `validationActions` names
+/// both `Deny` and `Warn`: a validation cannot both reject the request
+/// and only warn about it. The scaffold must refuse this binding rather
+/// than silently pick one of the two.
+#[test]
+fn test_scaffold_vap_rejects_a_binding_with_deny_and_warn() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding-deny-warn.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    cmd.assert().failure();
+    cmd.assert().stderr(contains("cannot contain both"));
+}
+
+/// `ClusterAdmissionPolicy` has no field that can hold a per-rule allow
+/// list of object names. A VAP `resourceRules` entry that sets
+/// `resourceNames` must fail the scaffold, rather than silently widen the
+/// generated policy to run on every object of that resource type.
+#[test]
+fn test_scaffold_vap_rejects_resource_names() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-resource-names.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    cmd.assert().failure();
+    cmd.assert().stderr(contains("resourceNames"));
+    assert!(
+        !wasm_output.exists(),
+        "no file should have been written when resourceNames is rejected"
+    );
+}
+
+/// A compiled VAP that calls `kw.k8s.apiVersion(...).kind(...).get(...)` has
+/// no `paramKind`, so `spec.contextAwareResources` stays empty and every
+/// `kw.k8s` call would be denied at evaluation time unless the user edits
+/// the generated output by hand. `kwctl` cannot statically derive which
+/// apiVersion/kind is targeted (see `context_aware_resources_from_param` in
+/// `scaffold/vap/compiled.rs`), so it must at least warn about it.
+#[test]
+fn test_scaffold_vap_compile_to_wasm_warns_about_kw_k8s_usage() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-k8s.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "command should succeed");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("this policy calls kw.k8s"),
+        "expected a kw.k8s warning on stderr, got: {stderr}"
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("contextAwareResources"),
+        "no contextAwareResources should have been derived for kw.k8s (the field is omitted when empty), got: {stdout}"
+    );
+}
+
+#[test]
+fn test_scaffold_vap_compile_to_wasm_metadata_already_exists() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+    // pre-create metadata.yml to trigger the conflict
+    std::fs::write(tempdir.path().join("metadata.yml"), b"existing").unwrap();
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    cmd.assert().failure();
+    cmd.assert().stderr(contains("metadata.yml already exists"));
+}
+
+/// `metadata.yml` is always written alongside the Wasm module (see
+/// `metadata_path_for` in `scaffold/vap/compiled.rs`), so a `wasm_path`
+/// literally named `metadata.yml` collides with it. `--force` must still
+/// reject this: the two files can never coexist at that path.
+#[test]
+fn test_scaffold_vap_compile_to_wasm_rejects_metadata_yml_as_the_wasm_path() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("metadata.yml");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output)
+        .arg("--force");
+
+    cmd.assert().failure();
+    cmd.assert()
+        .stderr(contains("reserved for the metadata.yml"));
+    assert!(
+        !wasm_output.exists(),
+        "expected no file to exist at the reserved path"
+    );
+}
+
+#[test]
+fn test_scaffold_vap_compile_to_wasm_conflicts_with_cel_policy() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output)
+        .arg("--cel-policy")
+        .arg("ghcr.io/kubewarden/policies/cel-policy:v1.0.0");
+
+    cmd.assert().failure();
+    cmd.assert().stderr(contains("cannot be used with"));
+}
+
+#[rstest]
 #[case::matching_capabilities("context-aware-annotate/metadata-correct.yml", false)]
 #[case::mismatched_capabilities("context-aware-annotate/metadata-wrong.yml", true)]
 fn test_annotate_host_capabilities(#[case] metadata_path: &str, #[case] expect_warning: bool) {
@@ -1049,6 +1407,7 @@ fn test_annotate_host_capabilities(#[case] metadata_path: &str, #[case] expect_w
     let mut cmd = setup_command(tempdir.path());
     cmd.arg("--no-color")
         .arg("annotate")
+        .arg("--force")
         .arg("-m")
         .arg(test_data(metadata_path))
         .arg(&wasm_path)
@@ -1113,6 +1472,306 @@ fn test_annotate_rego(
     } else {
         cmd.assert().failure();
         cmd.assert().stderr(predicate);
+    }
+}
+
+#[rstest]
+#[case::without_force(false)]
+#[case::with_force(true)]
+fn test_annotate_already_annotated_policy(#[case] force: bool) {
+    let tempdir = tempdir().unwrap();
+    let annotated_wasm = tempdir.path().join("annotated.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(&annotated_wasm);
+    cmd.assert().success();
+
+    // A second metadata file, with a different title. This lets the
+    // assertions below tell apart "overwrote" from "kept the old metadata
+    // and dropped the new one".
+    let new_title = "re-annotated-title";
+    let new_metadata = std::fs::read_to_string(test_data("rego-annotate/metadata-correct.yml"))
+        .unwrap()
+        .replace("disallow-service-loadbalancer", new_title);
+    let new_metadata_path = tempdir.path().join("metadata-new.yml");
+    std::fs::write(&new_metadata_path, new_metadata).unwrap();
+
+    let re_annotated_wasm = tempdir.path().join("re-annotated.wasm");
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate");
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.arg("-m")
+        .arg(&new_metadata_path)
+        .arg(&annotated_wasm)
+        .arg("-o")
+        .arg(&re_annotated_wasm);
+
+    if force {
+        cmd.assert().success().stderr(contains(
+            "policy is already annotated, overwriting existing metadata",
+        ));
+
+        let wasm_bytes = std::fs::read(&re_annotated_wasm).unwrap();
+        let module = walrus::Module::from_buffer(&wasm_bytes).unwrap();
+        let metadata_sections = module
+            .customs
+            .iter()
+            .filter(|(_, section)| section.name() == "io.kubewarden.metadata")
+            .count();
+        assert_eq!(metadata_sections, 1);
+
+        let metadata = policy_metadata::Metadata::from_path(&re_annotated_wasm)
+            .expect("cannot read metadata back")
+            .expect("metadata must be present");
+        assert_eq!(
+            metadata
+                .annotations
+                .unwrap()
+                .get("io.kubewarden.policy.title"),
+            Some(&new_title.to_string()),
+        );
+    } else {
+        cmd.assert().failure().stderr(contains("already annotated"));
+        assert!(
+            !re_annotated_wasm.exists(),
+            "no output file should be written when the command fails"
+        );
+    }
+}
+
+#[test]
+fn test_annotate_patch_a_single_annotation_on_an_already_annotated_policy() {
+    let tempdir = tempdir().unwrap();
+    let annotated_wasm = tempdir.path().join("annotated.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(&annotated_wasm);
+    cmd.assert().success();
+
+    // No --metadata-path and no --force. Patching one annotation on an
+    // already annotated policy must succeed anyway.
+    let patched_wasm = tempdir.path().join("patched.wasm");
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-a")
+        .arg("io.kubewarden.policy.title=patched-via-annotation")
+        .arg(&annotated_wasm)
+        .arg("-o")
+        .arg(&patched_wasm);
+    // `title` is already set by the fixture, so overwriting it must warn.
+    cmd.assert()
+        .success()
+        .stderr(contains("overwriting an existing annotation"));
+
+    let wasm_bytes = std::fs::read(&patched_wasm).unwrap();
+    let module = walrus::Module::from_buffer(&wasm_bytes).unwrap();
+    let metadata_sections = module
+        .customs
+        .iter()
+        .filter(|(_, section)| section.name() == "io.kubewarden.metadata")
+        .count();
+    assert_eq!(metadata_sections, 1);
+
+    let metadata = policy_metadata::Metadata::from_path(&patched_wasm)
+        .expect("cannot read metadata back")
+        .expect("metadata must be present");
+    let annotations = metadata.annotations.unwrap();
+    // The targeted annotation changed.
+    assert_eq!(
+        annotations.get("io.kubewarden.policy.title"),
+        Some(&String::from("patched-via-annotation")),
+    );
+    // Every other annotation, and the rules, stayed the same.
+    assert_eq!(
+        annotations.get("io.kubewarden.policy.author"),
+        Some(&String::from("Flavio Castelli")),
+    );
+    assert_eq!(metadata.rules.len(), 1);
+}
+
+#[test]
+fn test_annotate_metadata_path_and_annotation_combined() {
+    let tempdir = tempdir().unwrap();
+    let wasm_path = tempdir.path().join("annotated.wasm");
+
+    // A call like a CI pipeline would make: a static metadata.yml, plus
+    // one value that is only known at release time.
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg("-a")
+        .arg("io.kubewarden.policy.version=v9.9.9")
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(&wasm_path);
+    // `version` is absent from the fixture, so no key is overwritten.
+    cmd.assert()
+        .success()
+        .stderr(contains("overwriting an existing annotation").not());
+
+    let metadata = policy_metadata::Metadata::from_path(&wasm_path)
+        .expect("cannot read metadata back")
+        .expect("metadata must be present");
+    let annotations = metadata.annotations.unwrap();
+    assert_eq!(
+        annotations.get("io.kubewarden.policy.version"),
+        Some(&String::from("v9.9.9")),
+    );
+    // kwctl keeps the annotations that came from the file.
+    assert_eq!(
+        annotations.get("io.kubewarden.policy.title"),
+        Some(&String::from("disallow-service-loadbalancer")),
+    );
+}
+
+#[test]
+fn test_annotate_annotation_alone_requires_an_already_annotated_policy() {
+    let tempdir = tempdir().unwrap();
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-a")
+        .arg("io.kubewarden.policy.title=x")
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(tempdir.path().join("out.wasm"));
+
+    cmd.assert()
+        .failure()
+        .stderr(contains("not annotated"))
+        .stderr(contains("--metadata-path"));
+}
+
+#[test]
+fn test_annotate_rejects_a_malformed_annotation() {
+    let tempdir = tempdir().unwrap();
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg("-a")
+        .arg("novalue")
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(tempdir.path().join("out.wasm"));
+
+    cmd.assert()
+        .failure()
+        .stderr(contains("expected KEY=VALUE or KEY=@PATH"));
+}
+
+#[test]
+fn test_annotate_annotation_value_from_file() {
+    let tempdir = tempdir().unwrap();
+    let usage_content = "line one\nline two\n";
+    let usage_file = tempdir.path().join("usage.md");
+    std::fs::write(&usage_file, usage_content).unwrap();
+
+    let wasm_path = tempdir.path().join("annotated.wasm");
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg("-a")
+        .arg(format!(
+            "io.kubewarden.policy.usage=@{}",
+            usage_file.display()
+        ))
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(&wasm_path);
+    cmd.assert().success();
+
+    let metadata = policy_metadata::Metadata::from_path(&wasm_path)
+        .expect("cannot read metadata back")
+        .expect("metadata must be present");
+    assert_eq!(
+        metadata
+            .annotations
+            .unwrap()
+            .get("io.kubewarden.policy.usage"),
+        Some(&String::from(usage_content)),
+    );
+}
+
+/// Some metadata sections do not parse. For example, a newer kwctl can
+/// write a schema that this build does not know.
+///
+/// `--force` must replace such a section anyway. The user asked to discard
+/// it, so its content must not matter.
+///
+/// A patch must fail on such a section. The overrides apply on top of
+/// content that kwctl cannot read.
+#[rstest]
+#[case::replace_with_force(true, true, true, "")]
+#[case::replace_without_force(true, false, false, "already annotated")]
+#[case::patch(false, false, false, "Error reading the policy's existing metadata")]
+fn test_annotate_unreadable_existing_metadata(
+    #[case] with_metadata_path: bool,
+    #[case] with_force: bool,
+    #[case] success: bool,
+    #[case] expected_stderr: &str,
+) {
+    let tempdir = tempdir().unwrap();
+
+    // Build the fixture. Start from the rego policy, then add a metadata
+    // section that does not hold JSON.
+    let wasm_bytes =
+        std::fs::read(test_data("rego-annotate/no-default-namespace-rego.wasm")).unwrap();
+    let mut module = walrus::Module::from_buffer(&wasm_bytes).unwrap();
+    module.customs.add(walrus::RawCustomSection {
+        name: String::from("io.kubewarden.metadata"),
+        data: b"not json".to_vec(),
+    });
+    let unreadable_wasm = tempdir.path().join("unreadable.wasm");
+    module.emit_wasm_file(&unreadable_wasm).unwrap();
+
+    let output_wasm = tempdir.path().join("out.wasm");
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate");
+    if with_metadata_path {
+        cmd.arg("-m")
+            .arg(test_data("rego-annotate/metadata-correct.yml"));
+    } else {
+        cmd.arg("-a").arg("io.kubewarden.policy.title=x");
+    }
+    if with_force {
+        cmd.arg("--force");
+    }
+    cmd.arg(&unreadable_wasm).arg("-o").arg(&output_wasm);
+
+    if success {
+        cmd.assert().success();
+        let metadata = policy_metadata::Metadata::from_path(&output_wasm)
+            .expect("cannot read metadata back")
+            .expect("metadata must be present");
+        assert_eq!(
+            metadata
+                .annotations
+                .unwrap()
+                .get("io.kubewarden.policy.title"),
+            Some(&String::from("disallow-service-loadbalancer")),
+        );
+    } else {
+        cmd.assert().failure().stderr(contains(expected_stderr));
+        assert!(
+            !output_wasm.exists(),
+            "no output file should be written when the command fails"
+        );
     }
 }
 
@@ -1242,4 +1901,121 @@ fn get_manifest_annotations(
             _ => Err(anyhow::anyhow!("not an image manifest")),
         }
     })
+}
+
+// ─── Ferricel inspect tests ───────────────────────────────────────────────────
+
+/// Scaffold a VAP policy to Wasm, annotate it with the generated metadata.yml,
+/// then run `kwctl inspect` on the annotated module and assert that the
+/// "Ferricel" section is present in the human-readable output containing
+/// the producers (ferricel compiler version) and the embedded VAP source.
+#[test]
+fn test_inspect_ferricel_policy_pretty_output() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+    let annotated_wasm = tempdir.path().join("policy-annotated.wasm");
+
+    // Step 1: scaffold + compile
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+    cmd.assert().success();
+
+    // Step 2: annotate with the generated metadata.yml
+    let metadata_path = tempdir.path().join("metadata.yml");
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("--no-color")
+        .arg("annotate")
+        .arg("-m")
+        .arg(&metadata_path)
+        .arg(&wasm_output)
+        .arg("-o")
+        .arg(&annotated_wasm);
+    cmd.assert().success();
+
+    // Step 3: inspect — pretty output (default)
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("--no-color").arg("inspect").arg(&annotated_wasm);
+    cmd.assert().success();
+
+    let stdout = String::from_utf8(cmd.output().unwrap().stdout).unwrap();
+
+    // The "Ferricel" section header must be present
+    assert!(
+        stdout.contains("Ferricel"),
+        "expected 'Ferricel' section in inspect output, got:\n{stdout}"
+    );
+    // The producers section must mention ferricel (compiler version line)
+    assert!(
+        stdout.contains("ferricel"),
+        "expected ferricel in producers output, got:\n{stdout}"
+    );
+    // The VAP source must be present (the policy name is embedded in the source)
+    assert!(
+        stdout.contains("ValidatingAdmissionPolicy"),
+        "expected VAP source in inspect output, got:\n{stdout}"
+    );
+}
+
+/// Same scaffold + annotate flow, but with `-o yaml`; the output must still
+/// parse as a single YAML mapping and contain the `producers` and `vapSource` keys.
+#[test]
+fn test_inspect_ferricel_policy_yaml_output() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+    let annotated_wasm = tempdir.path().join("policy-annotated.wasm");
+
+    // scaffold + compile
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+    cmd.assert().success();
+
+    // annotate
+    let metadata_path = tempdir.path().join("metadata.yml");
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("--no-color")
+        .arg("annotate")
+        .arg("-m")
+        .arg(&metadata_path)
+        .arg(&wasm_output)
+        .arg("-o")
+        .arg(&annotated_wasm);
+    cmd.assert().success();
+
+    // inspect -o yaml
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("--no-color")
+        .arg("inspect")
+        .arg("-o")
+        .arg("yaml")
+        .arg(&annotated_wasm);
+    cmd.assert().success();
+
+    let stdout_bytes = cmd.output().unwrap().stdout;
+    let doc: serde_yaml::Mapping = serde_yaml::from_slice(&stdout_bytes)
+        .expect("inspect -o yaml must produce a single parseable YAML mapping");
+
+    assert!(
+        doc.contains_key("producers"),
+        "yaml output must contain 'producers' key, got keys: {:?}",
+        doc.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        doc.contains_key("vapSource"),
+        "yaml output must contain 'vapSource' key, got keys: {:?}",
+        doc.keys().collect::<Vec<_>>()
+    );
 }

@@ -5,17 +5,19 @@ use kubewarden_policy_sdk::host_capabilities::net::LookupResponse;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
-use crate::callback_handler::kubernetes::field_mask;
-use crate::callback_requests::{CallbackRequest, CallbackRequestType, CallbackResponse};
+use crate::{
+    callback_handler::kubernetes::field_mask,
+    callback_requests::{CallbackRequest, CallbackRequestType, CallbackResponse},
+};
 
 mod builder;
+mod cache_return;
 mod crypto;
 mod kubernetes;
 mod oci;
 mod sigstore_verification;
 
 pub use builder::CallbackHandlerBuilder;
-
 use sigstore_verification::{
     get_sigstore_certificate_verification_cached, get_sigstore_github_actions_verification_cached,
     get_sigstore_keyless_prefix_verification_cached, get_sigstore_keyless_verification_cached,
@@ -92,8 +94,8 @@ impl CallbackHandler {
 
     async fn handle_request(&mut self, req: CallbackRequest) {
         let oci_client = self.oci_client.clone();
-        let mut sigstore_client = self.sigstore_client.clone();
-        let mut kubernetes_client = self.kubernetes_client.clone();
+        let sigstore_client = self.sigstore_client.clone();
+        let kubernetes_client = self.kubernetes_client.clone();
 
         tokio::spawn(async move {
             match req.request {
@@ -119,7 +121,7 @@ impl CallbackHandler {
                 } => {
                     handle_callback!(req, image, "Sigstore pub key verification done", {
                         get_sigstore_pub_key_verification_cached(
-                            &mut sigstore_client,
+                            &sigstore_client,
                             image.clone(),
                             pub_keys,
                             annotations,
@@ -133,7 +135,7 @@ impl CallbackHandler {
                 } => {
                     handle_callback!(req, image, "Sigstore keyless verification done", {
                         get_sigstore_keyless_verification_cached(
-                            &mut sigstore_client,
+                            &sigstore_client,
                             image.clone(),
                             keyless,
                             annotations,
@@ -147,7 +149,7 @@ impl CallbackHandler {
                 } => {
                     handle_callback!(req, image, "Sigstore keyless prefix verification done", {
                         get_sigstore_keyless_prefix_verification_cached(
-                            &mut sigstore_client,
+                            &sigstore_client,
                             image.clone(),
                             keyless_prefix,
                             annotations,
@@ -162,7 +164,7 @@ impl CallbackHandler {
                 } => {
                     handle_callback!(req, image, "Sigstore GitHub Action verification done", {
                         get_sigstore_github_actions_verification_cached(
-                            &mut sigstore_client,
+                            &sigstore_client,
                             image.clone(),
                             owner,
                             repo,
@@ -179,7 +181,7 @@ impl CallbackHandler {
                 } => {
                     handle_callback!(req, image, "Sigstore GitHub Action verification done", {
                         get_sigstore_certificate_verification_cached(
-                            &mut sigstore_client,
+                            &sigstore_client,
                             &image,
                             &certificate,
                             certificate_chain.as_deref(),
@@ -218,7 +220,7 @@ impl CallbackHandler {
                         "List namespaced Kubernetes resource",
                         {
                             kubernetes::list_resources_by_namespace(
-                                kubernetes_client.as_mut(),
+                                kubernetes_client.as_ref(),
                                 &api_version,
                                 &kind,
                                 &namespace,
@@ -242,7 +244,7 @@ impl CallbackHandler {
                         "List Kubernetes resource",
                         {
                             kubernetes::list_resources_all(
-                                kubernetes_client.as_mut(),
+                                kubernetes_client.as_ref(),
                                 &api_version,
                                 &kind,
                                 label_selector,
@@ -267,7 +269,7 @@ impl CallbackHandler {
                             "Get Kubernetes resource - no cache",
                             {
                                 let res = kubernetes::get_resource(
-                                    kubernetes_client.as_mut(),
+                                    kubernetes_client.as_ref(),
                                     &api_version,
                                     &kind,
                                     &name,
@@ -292,7 +294,7 @@ impl CallbackHandler {
                             "Get Kubernetes resource",
                             {
                                 let res = kubernetes::get_resource_cached(
-                                    kubernetes_client.as_mut(),
+                                    kubernetes_client.as_ref(),
                                     &api_version,
                                     &kind,
                                     &name,
@@ -320,7 +322,7 @@ impl CallbackHandler {
                         "Get Kubernetes resource plural name",
                         {
                             kubernetes::get_resource_plural_name(
-                                kubernetes_client.as_mut(),
+                                kubernetes_client.as_ref(),
                                 &api_version,
                                 &kind,
                             )
@@ -341,7 +343,7 @@ impl CallbackHandler {
                         "Has the result of 'Kubernetes list all resources' changed since a given instant",
                         {
                             kubernetes::has_list_resources_all_result_changed_since_instant(
-                                kubernetes_client.as_mut(),
+                                kubernetes_client.as_ref(),
                                 &api_version,
                                 &kind,
                                 label_selector,
@@ -361,14 +363,14 @@ impl CallbackHandler {
                             req,
                             "can_i".to_owned(),
                             "Check if user or service account has permission to perform operation",
-                            { kubernetes::can_i(kubernetes_client.as_mut(), request) }
+                            { kubernetes::can_i(kubernetes_client.as_ref(), request) }
                         )
                     } else {
                         handle_callback!(
                             req,
                             "can_i".to_owned(),
                             "Check if user or service account has permission to perform operation",
-                            { kubernetes::can_i_cached(kubernetes_client.as_mut(), request) }
+                            { kubernetes::can_i_cached(kubernetes_client.as_ref(), request) }
                         )
                     }
                 }

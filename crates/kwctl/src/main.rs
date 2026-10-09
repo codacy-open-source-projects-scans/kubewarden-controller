@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
                     "policy push"
                 );
 
-                let force = matches.contains_id("force");
+                let force = matches.get_flag("force");
 
                 let immutable_ref = push::push(wasm_path, &uri, sources.as_ref(), force).await?;
 
@@ -220,18 +220,33 @@ async fn main() -> Result<()> {
                     .get_one::<String>("wasm-path")
                     .map(|output| PathBuf::from_str(output).unwrap())
                     .unwrap();
-                let metadata_file = matches
+                let metadata_path = matches
                     .get_one::<String>("metadata-path")
-                    .map(|output| PathBuf::from_str(output).unwrap())
-                    .unwrap();
+                    .map(|output| PathBuf::from_str(output).unwrap());
                 let destination = matches
                     .get_one::<String>("output-path")
                     .map(|output| PathBuf::from_str(output).unwrap())
                     .unwrap();
-                let usage_file = matches
+                let usage_path = matches
                     .get_one::<String>("usage-path")
                     .map(|output| PathBuf::from_str(output).unwrap());
-                annotate::write_annotation(wasm_path, metadata_file, destination, usage_file)?;
+                let annotations = matches
+                    .get_many::<String>("annotation")
+                    .map(|values| values.map(String::from).collect())
+                    .unwrap_or_default();
+                let force = matches.get_flag("force");
+                let metadata = match metadata_path {
+                    Some(path) => annotate::MetadataSource::File(path),
+                    None => annotate::MetadataSource::Policy,
+                };
+                annotate::write_annotation(annotate::AnnotateRequest {
+                    wasm_path,
+                    metadata,
+                    destination,
+                    annotations,
+                    usage_path,
+                    force,
+                })?;
             }
             Ok(())
         }
@@ -305,11 +320,16 @@ async fn main() -> Result<()> {
                 let vap_file: PathBuf = matches.get_one::<String>("policy").unwrap().into();
                 let vap_binding_file: PathBuf =
                     matches.get_one::<String>("binding").unwrap().into();
+                let compile_to_wasm: Option<PathBuf> =
+                    matches.get_one::<String>("compile-to-wasm").map(Into::into);
+                let force = matches.get_flag("force");
 
                 scaffold::vap(
                     cel_policy_uri.as_str(),
                     vap_file.as_path(),
                     vap_binding_file.as_path(),
+                    compile_to_wasm.as_deref(),
+                    force,
                 )?;
             };
             if let Some(matches) = matches.subcommand_matches("scaffold")
@@ -373,7 +393,11 @@ async fn main() -> Result<()> {
                 let output = matches.get_one::<String>("output").unwrap();
                 let mut file = std::fs::File::create(output)
                     .map_err(|e| anyhow!("cannot create file {}: {}", output, e))?;
-                let docs_content = clap_markdown::help_markdown_command(&cli::build_cli());
+                let docs_content = if output.ends_with(".md") {
+                    clap_documentation::help_markdown_command(&cli::build_cli())
+                } else {
+                    clap_documentation::help_asciidoc_command(&cli::build_cli())
+                };
                 file.write_all(docs_content.as_bytes())
                     .map_err(|e| anyhow!("cannot write to file {}: {}", output, e))?;
             }

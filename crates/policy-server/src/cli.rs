@@ -1,5 +1,7 @@
-use clap::builder::PossibleValue;
-use clap::{Arg, ArgAction, Command, crate_authors, crate_description, crate_name, crate_version};
+use clap::{
+    Arg, ArgAction, Command, builder::PossibleValue, crate_authors, crate_description, crate_name,
+    crate_version,
+};
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use policy_evaluator::burrego;
@@ -175,6 +177,19 @@ pub(crate) fn build_cli() -> Command {
             .default_value("2")
             .help("Interrupt policy evaluation after the given time"),
 
+        Arg::new("disable-memory-limit")
+            .long("disable-memory-limit")
+            .action(ArgAction::SetTrue)
+            .env("KUBEWARDEN_DISABLE_MEMORY_LIMIT")
+            .help("Disable policy memory limit"),
+
+        Arg::new("policy-memory-limit")
+            .long("policy-memory-limit")
+            .env("KUBEWARDEN_POLICY_MEMORY_LIMIT")
+            .value_name("MAXIMUM_MEMORY_MIB")
+            .default_value("256")
+            .help("Maximum amount of linear memory, in MiB, a policy is allowed to use"),
+
         Arg::new("daemon")
             .long("daemon")
             .env("KUBEWARDEN_DAEMON")
@@ -228,7 +243,7 @@ pub(crate) fn build_cli() -> Command {
         .args(args)
         .subcommand(
             Command::new("docs")
-                .about("Generates the markdown documentation for policy-server commands")
+                .about("Generates documentation for policy-server commands. The output format is determined by the file extension: .md for Markdown, AsciiDoc otherwise")
                 .arg(
                     Arg::new("output")
                         .long("output")

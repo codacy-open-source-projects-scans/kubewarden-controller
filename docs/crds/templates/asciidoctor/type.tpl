@@ -5,7 +5,7 @@
 [id="{{ asciidocTypeID $type | asciidocRenderAnchorID }}"]
 ==== {{ $type.Name  }}
 
-{{ if $type.IsAlias }}_Underlying type:_ _{{ asciidocRenderTypeLink $type.UnderlyingType  }}_{{ end }}
+{{ if $type.IsAlias }}_Underlying type:_ _{{ asciidocRenderType $type.UnderlyingType  }}_{{ end }}
 
 {{ $type.Doc }}
 
@@ -20,7 +20,9 @@
 .Appears In:
 ****
 {{- range $type.SortedReferences }}
+{{- if asciidocShouldRenderType . }}
 - {{ asciidocRenderTypeLink . }}
+{{- end }}
 {{- end }}
 ****
 {{- end }}
@@ -34,8 +36,14 @@
 | *`kind`* __string__ | `{{ $type.GVK.Kind }}` | |
 {{ end -}}
 
+{{- /* crd-ref-docs emits valueless markers as "Optional: {}", which the renderer
+       then escapes into "Optional: \{}". Trim the empty value until the upstream
+       fix lands: https://github.com/elastic/crd-ref-docs/issues/198 */ -}}
 {{ range $type.Members -}}
-| *`{{ .Name  }}`* __{{ asciidocRenderType .Type }}__ | {{ template "type_members" . }} | {{ .Default }} | {{ range .Validation -}} {{ asciidocRenderValidation . }} +
+| *`{{ .Name  }}`* __{{ asciidocRenderType .Type }}__
+a| {{ template "type_members" . }}
+| {{ .Default }}
+| {{ range .Validation -}} {{ asciidocRenderValidation (trimSuffix ": {}" .) }} +
 {{ end }}
 {{ end -}}
 |===

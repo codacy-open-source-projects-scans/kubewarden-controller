@@ -34,10 +34,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	policiesv1 "github.com/kubewarden/kubewarden-controller/api/policies/v1"
-	"github.com/kubewarden/kubewarden-controller/internal/certs"
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/certs"
+	"github.com/kubewarden/adm-controller/internal/constants"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	//+kubebuilder:scaffold:imports
 )
@@ -54,6 +55,21 @@ const (
 	deploymentsNamespace = "kubewarden-integration-tests"
 )
 
+// kubewardenCRDPaths returns the paths to the Kubewarden admission controller
+// CRD files in the Helm chart. The imported policy-report CRDs are excluded
+// because they are wrapped in Helm conditionals and cannot be parsed as plain
+// YAML by envtest.
+func kubewardenCRDPaths() []string {
+	dir := filepath.Join("..", "..", "charts", "admission-controller", "templates", "crds")
+	return []string{
+		filepath.Join(dir, "policies.kubewarden.io_admissionpolicies.yaml"),
+		filepath.Join(dir, "policies.kubewarden.io_admissionpolicygroups.yaml"),
+		filepath.Join(dir, "policies.kubewarden.io_clusteradmissionpolicies.yaml"),
+		filepath.Join(dir, "policies.kubewarden.io_clusteradmissionpolicygroups.yaml"),
+		filepath.Join(dir, "policies.kubewarden.io_policyservers.yaml"),
+	}
+}
+
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
 
@@ -67,8 +83,9 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	ctx, cancel := context.WithCancel(context.TODO())
 
 	testEnv := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
+		CRDInstallOptions: envtest.CRDInstallOptions{
+			Paths: kubewardenCRDPaths(),
+		},
 	}
 
 	restConfig, err := testEnv.Start()
@@ -86,13 +103,17 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 
 	k8sManager, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme.Scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
 	})
 	Expect(err).ToNot(HaveOccurred())
 
 	err = (&AdmissionPolicyReconciler{
-		Client:               k8sManager.GetClient(),
-		Scheme:               k8sManager.GetScheme(),
-		DeploymentsNamespace: deploymentsNamespace,
+		Client:                  k8sManager.GetClient(),
+		Scheme:                  k8sManager.GetScheme(),
+		DeploymentsNamespace:    deploymentsNamespace,
+		ControllerConfigMapName: constants.DefaultControllerConfigMapName,
 		FeatureGateAdmissionWebhookMatchConditions: true,
 	}).SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
@@ -106,9 +127,10 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	Expect(err).ToNot(HaveOccurred())
 
 	err = (&AdmissionPolicyGroupReconciler{
-		Client:               k8sManager.GetClient(),
-		Scheme:               k8sManager.GetScheme(),
-		DeploymentsNamespace: deploymentsNamespace,
+		Client:                  k8sManager.GetClient(),
+		Scheme:                  k8sManager.GetScheme(),
+		DeploymentsNamespace:    deploymentsNamespace,
+		ControllerConfigMapName: constants.DefaultControllerConfigMapName,
 		FeatureGateAdmissionWebhookMatchConditions: true,
 	}).SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
@@ -122,11 +144,25 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	Expect(err).ToNot(HaveOccurred())
 
 	err = (&PolicyServerReconciler{
-		Client:                k8sManager.GetClient(),
-		Scheme:                k8sManager.GetScheme(),
-		DeploymentsNamespace:  deploymentsNamespace,
-		ClientCAConfigMapName: clientCAConfigMapName,
-		ImagePullSecrets:      []corev1.LocalObjectReference{{Name: reconcilerImagePullSecret}},
+		Client:                  k8sManager.GetClient(),
+		Scheme:                  k8sManager.GetScheme(),
+		DeploymentsNamespace:    deploymentsNamespace,
+		ClientCAConfigMapName:   clientCAConfigMapName,
+		ControllerConfigMapName: constants.DefaultControllerConfigMapName,
+		ImagePullSecrets:        []corev1.LocalObjectReference{{Name: reconcilerImagePullSecret}},
+		PolicyServerMetricsPort: constants.PolicyServerMetricsPort,
+		TelemetryConfiguration: TelemetryConfiguration{
+			MetricsEnabled: true,
+		},
+	}).SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = (&DefaultsApplierReconciler{
+		Client:               k8sManager.GetClient(),
+		Scheme:               k8sManager.GetScheme(),
+		Log:                  ctrl.Log.WithName("defaults-applier-test"),
+		DeploymentsNamespace: deploymentsNamespace,
+		ConfigMapName:        constants.DefaultDefaultsConfigMapName,
 	}).SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
@@ -150,6 +186,19 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		Data: map[string][]byte{
 			constants.CARootCert:       caCertBytes,
 			constants.CARootPrivateKey: caPrivateKey,
+		},
+	})
+	Expect(err).NotTo(HaveOccurred())
+
+	// Create the controller configuration ConfigMap. The configuration holds
+	// the allow list of resources for namespaced policies
+	err = k8sClient.Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      constants.DefaultControllerConfigMapName,
+			Namespace: deploymentsNamespace,
+		},
+		Data: map[string]string{
+			constants.ControllerConfigKey: testControllerConfigYAML,
 		},
 	})
 	Expect(err).NotTo(HaveOccurred())

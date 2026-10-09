@@ -29,6 +29,8 @@ import (
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/matchconditions"
 	"k8s.io/apiserver/pkg/cel"
 	"k8s.io/apiserver/pkg/cel/environment"
+
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 // nonStrictStatelessCELCompiler is a cel Compiler that does not enforce strict cost enforcement.
@@ -38,42 +40,11 @@ var (
 	nonStrictStatelessCELCompiler = plugincel.NewCompiler(environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion()))
 )
 
-const maxMatchConditionsCount = 64
-
-type sensitiveResource struct {
-	APIGroup string
-	Resource string
-}
-
-func (sr sensitiveResource) String() string {
-	return fmt.Sprintf("APIGroup: %s, Resource: %s", sr.APIGroup, sr.Resource)
-}
-
-func (sr sensitiveResource) MatchesRules(apiGroups []string, resource []string) bool {
-	apiGroupMatches := false
-	for _, apiGroup := range apiGroups {
-		if apiGroup == sr.APIGroup || apiGroup == "*" {
-			apiGroupMatches = true
-			break
-		}
-	}
-
-	resourceMatches := false
-	for _, res := range resource {
-		if res == sr.Resource || res == "*" || res == "*/*" || strings.HasPrefix(res, sr.Resource+"/") {
-			resourceMatches = true
-			break
-		}
-	}
-
-	return apiGroupMatches && resourceMatches
-}
-
-func defaultSensitiveResources() []sensitiveResource {
-	return []sensitiveResource{
-		{APIGroup: "wgpolicyk8s.io", Resource: "policyreports"},
-	}
-}
+const (
+	maxMatchConditionsCount = 64
+	wildcardAllResources    = "*/*"
+	protectMode             = "protect"
+)
 
 func validatePolicyCreate(policy Policy) field.ErrorList {
 	var allErrors field.ErrorList
@@ -81,6 +52,9 @@ func validatePolicyCreate(policy Policy) field.ErrorList {
 	allErrors = append(allErrors, validateRulesField(policy)...)
 	allErrors = append(allErrors, validateMatchConditions(policy.GetMatchConditions(), field.NewPath("spec").Child("matchConditions"))...)
 	allErrors = append(allErrors, validateTimeoutSeconds(policy)...)
+	if err := validateUniqueNameLength(policy); err != nil {
+		allErrors = append(allErrors, err)
+	}
 	return allErrors
 }
 
@@ -100,6 +74,31 @@ func validatePolicyUpdate(oldPolicy, newPolicy Policy) field.ErrorList {
 	return allErrors
 }
 
+// validateUniqueNameLength ensures that the policy's derived unique name,
+// once combined with the suffix used to build the corresponding webhook
+// entry name, does not exceed the Kubernetes DNS1123 subdomain length limit.
+// Name and namespace are immutable, so this is only checked on creation:
+// checking it on update as well would make an already-persisted, overlong
+// policy impossible to modify without providing any additional protection.
+func validateUniqueNameLength(policy Policy) *field.Error {
+	webhookName := policy.GetUniqueName() + constants.WebhookNameSuffix
+	if len(webhookName) <= validation.DNS1123SubdomainMaxLength {
+		return nil
+	}
+
+	maxNameLength := validation.DNS1123SubdomainMaxLength - len(constants.WebhookNameSuffix) - len(policy.GetUniqueName()) + len(policy.GetName())
+
+	return field.Invalid(
+		field.NewPath("metadata").Child("name"),
+		policy.GetName(),
+		fmt.Sprintf(
+			"the policy name combined with its namespace and kind produces an identity that is too long (%d characters, max %d); "+
+				"the name must be at most %d characters long",
+			len(webhookName), validation.DNS1123SubdomainMaxLength, maxNameLength,
+		),
+	)
+}
+
 // Validates the spec.Rules field for non-empty, webhook-valid rules.
 func validateRulesField(policy Policy) field.ErrorList {
 	var allErrors field.ErrorList
@@ -114,21 +113,25 @@ func validateRulesField(policy Policy) field.ErrorList {
 	_, isAdmissionPolicy := policy.(*AdmissionPolicy)
 	_, isAdmissionPolicyGroup := policy.(*AdmissionPolicyGroup)
 
-	for _, rule := range policy.GetRules() {
+	for i, rule := range policy.GetRules() {
+		ruleField := rulesField.Index(i)
 		switch {
 		case len(rule.Operations) == 0:
-			opField := rulesField.Child("operations")
-			allErrors = append(allErrors, field.Required(opField, "a value must be specified"))
+			allErrors = append(allErrors, field.Required(ruleField.Child("operations"), "a value must be specified"))
 		case len(rule.Rule.APIVersions) == 0 || len(rule.Rule.Resources) == 0:
-			allErrors = append(allErrors, field.Required(rulesField, "apiVersions and resources must have specified values"))
+			if len(rule.Rule.APIVersions) == 0 {
+				allErrors = append(allErrors, field.Required(ruleField.Child("apiVersions"), "a value must be specified"))
+			}
+			if len(rule.Rule.Resources) == 0 {
+				allErrors = append(allErrors, field.Required(ruleField.Child("resources"), "a value must be specified"))
+			}
 		default:
-			allErrors = append(allErrors, checkOperationsArrayForEmptyString(rule.Operations, rulesField)...)
-			allErrors = append(allErrors, checkRulesArrayForEmptyString(rule.Rule.APIVersions, rulesField.Child("rule.apiVersions"))...)
-			allErrors = append(allErrors, checkRulesArrayForEmptyString(rule.Rule.Resources, rulesField.Child("rule.resources"))...)
+			allErrors = append(allErrors, checkOperationsArrayForEmptyString(rule.Operations, ruleField)...)
+			allErrors = append(allErrors, checkRulesArrayForEmptyString(rule.Rule.APIVersions, ruleField.Child("apiVersions"))...)
+			allErrors = append(allErrors, checkRulesArrayForEmptyString(rule.Rule.Resources, ruleField.Child("resources"))...)
 
 			if isAdmissionPolicy || isAdmissionPolicyGroup {
-				allErrors = append(allErrors, checkRulesArrayForWildcardUsage(rule.Rule.APIVersions, rule.Rule.Resources, rulesField)...)
-				allErrors = append(allErrors, checkRulesArrayForSensitiveResourcesBeingTargeted(rule.Rule.APIVersions, rule.Rule.Resources, rulesField)...)
+				allErrors = append(allErrors, checkRulesArrayForWildcardUsage(rule.Rule, ruleField)...)
 			}
 		}
 	}
@@ -136,37 +139,37 @@ func validateRulesField(policy Policy) field.ErrorList {
 	return allErrors
 }
 
-// checkOperationsArrayForEmptyString checks if any of the values in the operations array is the empty string and returns
-// an error if this is true.
-func checkOperationsArrayForEmptyString(operationsArray []admissionregistrationv1.OperationType, rulesField *field.Path) field.ErrorList {
+// checkOperationsArrayForEmptyString returns one error for each empty
+// string in the operations list.
+func checkOperationsArrayForEmptyString(operationsArray []admissionregistrationv1.OperationType, ruleField *field.Path) field.ErrorList {
 	var allErrors field.ErrorList
 
 	for i, operation := range operationsArray {
 		if operation == "" {
-			allErrors = append(allErrors, field.Required(rulesField.Child("operations").Index(i), "must be non-empty"))
+			allErrors = append(allErrors, field.Required(ruleField.Child("operations").Index(i), "must be non-empty"))
 		}
 	}
 
 	return allErrors
 }
 
-// checkRulesArrayForEmptyString checks if any of the values specified is the empty string and returns an error if this
-// is true.
-func checkRulesArrayForEmptyString(rulesArray []string, rulesField *field.Path) field.ErrorList {
+// checkRulesArrayForEmptyString returns one error for each empty string in
+// the list.
+func checkRulesArrayForEmptyString(rulesArray []string, ruleField *field.Path) field.ErrorList {
 	var allErrors field.ErrorList
 
 	for i, apiVersion := range rulesArray {
 		if apiVersion == "" {
-			allErrors = append(allErrors, field.Required(rulesField.Index(i), "must be non-empty"))
+			allErrors = append(allErrors, field.Required(ruleField.Index(i), "must be non-empty"))
 		}
 	}
 
 	return allErrors
 }
 
-// checkRulesArrayForWildcardUsage checks if the rules array contains a wildcard and returns an error if both the apiGroups
-// and resources contain wildcards.
-func checkRulesArrayForWildcardUsage(rulesAPIGroups []string, rulesResources []string, rulesField *field.Path) field.ErrorList {
+// checkRulesArrayForWildcardUsage returns an error when apiGroups and
+// resources both contain a wildcard.
+func checkRulesArrayForWildcardUsage(rule admissionregistrationv1.Rule, ruleField *field.Path) field.ErrorList {
 	var allErrors field.ErrorList
 
 	apiGroupHasWildcard := false
@@ -175,7 +178,7 @@ func checkRulesArrayForWildcardUsage(rulesAPIGroups []string, rulesResources []s
 	resourceHasWildcard := false
 	resourceWildcardIndex := -1
 
-	for i, apiGroup := range rulesAPIGroups {
+	for i, apiGroup := range rule.APIGroups {
 		if apiGroup == "*" {
 			apiGroupHasWildcard = true
 			apiGroupWildcardIndex = i
@@ -183,8 +186,8 @@ func checkRulesArrayForWildcardUsage(rulesAPIGroups []string, rulesResources []s
 		}
 	}
 
-	for i, resource := range rulesResources {
-		if resource == "*" || resource == "*/*" {
+	for i, resource := range rule.Resources {
+		if resource == "*" || resource == wildcardAllResources {
 			resourceHasWildcard = true
 			resourceWildcardIndex = i
 			break
@@ -192,24 +195,8 @@ func checkRulesArrayForWildcardUsage(rulesAPIGroups []string, rulesResources []s
 	}
 
 	if apiGroupHasWildcard && resourceHasWildcard {
-		allErrors = append(allErrors, field.Forbidden(rulesField.Child("apiGroups").Index(apiGroupWildcardIndex), "apiGroups cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup"))
-		allErrors = append(allErrors, field.Forbidden(rulesField.Child("resources").Index(resourceWildcardIndex), "resources cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup"))
-	}
-
-	return allErrors
-}
-
-// checkRulesArrayForSensitiveResourcesBeingTargeted checks if any of the sensitive resources are being targeted by the
-// rule.
-func checkRulesArrayForSensitiveResourcesBeingTargeted(rulesAPIGroups []string, rulesResources []string, rulesField *field.Path) field.ErrorList {
-	var allErrors field.ErrorList
-
-	sensitiveResources := defaultSensitiveResources()
-
-	for _, sensitiveResource := range sensitiveResources {
-		if sensitiveResource.MatchesRules(rulesAPIGroups, rulesResources) {
-			allErrors = append(allErrors, field.Forbidden(rulesField, fmt.Sprintf("{%s} resources cannot be targeted by AdmissionPolicy or AdmissionPolicyGroup", sensitiveResource)))
-		}
+		allErrors = append(allErrors, field.Forbidden(ruleField.Child("apiGroups").Index(apiGroupWildcardIndex), "apiGroups cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup"))
+		allErrors = append(allErrors, field.Forbidden(ruleField.Child("resources").Index(resourceWildcardIndex), "resources cannot use wildcards when using AdmissionPolicy or AdmissionPolicyGroup"))
 	}
 
 	return allErrors
@@ -224,7 +211,7 @@ func validatePolicyServerField(oldPolicy, newPolicy Policy) *field.Error {
 }
 
 func validatePolicyModeField(oldPolicy, newPolicy Policy) *field.Error {
-	if oldPolicy.GetPolicyMode() == "protect" && newPolicy.GetPolicyMode() == "monitor" {
+	if oldPolicy.GetPolicyMode() == protectMode && newPolicy.GetPolicyMode() == "monitor" {
 		return field.Forbidden(field.NewPath("spec").Child("mode"), "field cannot transition from protect to monitor. Recreate instead.")
 	}
 

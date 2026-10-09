@@ -23,7 +23,7 @@ import (
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 
-	"github.com/kubewarden/kubewarden-controller/internal/constants"
+	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 func TestAdmissionPolicyGroupDefault(t *testing.T) {
@@ -34,7 +34,7 @@ func TestAdmissionPolicyGroupDefault(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, constants.DefaultPolicyServer, policy.GetPolicyServer())
-	assert.Contains(t, policy.GetFinalizers(), constants.KubewardenFinalizer)
+	assert.NotContains(t, policy.GetFinalizers(), constants.KubewardenFinalizer)
 }
 
 func TestAdmissionPolicyGroupValidateCreate(t *testing.T) {

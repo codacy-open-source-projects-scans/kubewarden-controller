@@ -14,6 +14,8 @@ pub mod metrics;
 pub mod profiling;
 pub mod tracing;
 
+use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
+
 use ::tracing::{Level, debug, info, trace, warn};
 use anyhow::{Result, anyhow};
 use axum::{
@@ -22,6 +24,7 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use certs::create_tls_config_and_watch_certificate_changes;
+use config::Config;
 use evaluation::EvaluationEnvironmentBuilder;
 use policy_evaluator::{
     callback_handler::{CallbackHandler, CallbackHandlerBuilder},
@@ -32,23 +35,24 @@ use policy_evaluator::{
 use profiling::activate_memory_profiling;
 use rayon::prelude::*;
 use sigstore_protobuf_specs::dev::sigstore::trustroot::v1::ClientTrustConfig;
-use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use tikv_jemallocator::Jemalloc;
 use tokio::{
     sync::{Notify, Semaphore, oneshot},
     time,
 };
 use tower_http::trace::{self, TraceLayer};
 
-use crate::api::handlers::{
-    audit_handler, pprof_get_cpu, pprof_get_heap, readiness_handler, validate_handler,
-    validate_raw_handler,
+use crate::{
+    api::{
+        handlers::{
+            audit_handler, pprof_get_cpu, pprof_get_heap, readiness_handler, validate_handler,
+            validate_raw_handler,
+        },
+        state::ApiServerState,
+    },
+    evaluation::precompiled_policy::{PrecompiledPolicies, PrecompiledPolicy},
+    policy_downloader::{Downloader, FetchedPolicies},
 };
-use crate::api::state::ApiServerState;
-use crate::evaluation::precompiled_policy::{PrecompiledPolicies, PrecompiledPolicy};
-use crate::policy_downloader::{Downloader, FetchedPolicies};
-use config::Config;
-
-use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -149,17 +153,13 @@ impl PolicyServer {
         // required by policies built by the official go compiler >= 1.26.0
         wasmtime_config.wasm_function_references(true);
 
-        let any_policy_has_timeout = config.policies.values().any(|policy| match policy {
-            config::PolicyOrPolicyGroup::Policy {
-                timeout_eval_seconds,
-                ..
-            } => timeout_eval_seconds.is_some(),
-            config::PolicyOrPolicyGroup::PolicyGroup { policies, .. } => policies
-                .values()
-                .any(|member| member.timeout_eval_seconds.is_some()),
-        });
-        if config.policy_evaluation_limit_seconds.is_some() || any_policy_has_timeout {
+        if config.policy_evaluation_limit_seconds.is_some() {
             wasmtime_config.epoch_interruption(true);
+        } else if config::any_policy_has_timeout(&config.policies) {
+            warn!(
+                "timeout protection is disabled: the timeoutEvalSeconds setting of policies \
+                 will be ignored"
+            );
         }
 
         let engine = wasmtime::Engine::new(&wasmtime_config)?;
@@ -186,6 +186,10 @@ impl PolicyServer {
         if let Some(limit) = config.policy_evaluation_limit_seconds {
             evaluation_environment_builder =
                 evaluation_environment_builder.with_global_policy_evaluation_limit_seconds(limit);
+        }
+        if let Some(limit) = config.policy_memory_limit_bytes {
+            evaluation_environment_builder =
+                evaluation_environment_builder.with_policy_memory_limit(limit);
         }
         let evaluation_environment = evaluation_environment_builder.build(&config.policies)?;
 
@@ -219,6 +223,15 @@ impl PolicyServer {
             });
         } else {
             info!("policy timeout protection is disabled");
+        }
+
+        if let Some(limit) = config.policy_memory_limit_bytes {
+            info!(
+                policy_memory_limit_bytes = limit,
+                "policy memory limit is enabled"
+            );
+        } else {
+            warn!("policy memory limit is disabled");
         }
 
         let state = Arc::new(ApiServerState {
