@@ -123,6 +123,7 @@ additionalAnnotations: {}
 # securityContext of the container
 containerSecurityContext:
   allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
   capabilities:
     drop:
       - ALL
@@ -133,12 +134,13 @@ podSecurityContext:
   runAsNonRoot: true
   seccompProfile:
     type: RuntimeDefault
-# SecurityContext to be used in the pre-delete-hook job container and pod.
-# The content of the next fields will be set directly as the securityContext
-# of the container and pod used in the pre-delete-hook job.
+# SecurityContext to be used in the pre-delete-hook and post-install-hook job
+# containers and pods. The content of the next fields will be set directly as
+# the securityContext of the container and pod used in those jobs.
 preDeleteHook:
   containerSecurityContext:
     allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
     capabilities:
       drop:
         - ALL
@@ -168,7 +170,8 @@ alwaysAcceptAdmissionReviewsOnDeploymentsNamespace: true
 #
 # The default list contains Kubernetes resources that are considered
 # safe to be validated or mutated by namespaced policies.
-namespacedPoliciesAllowedResources: # @schema type:[array, null]
+# @schema type:[array, null]
+namespacedPoliciesAllowedResources:
   - apiGroups: # @schema minItems:1; required:true; item:string
       - ""
     resources: # @schema minItems:1; required:true; item:string
@@ -481,6 +484,7 @@ policyServer:
         - namespaces
         - pods
         - services
+        - configmaps
     - apiGroup: "networking.k8s.io"
       resources:
         - ingresses
